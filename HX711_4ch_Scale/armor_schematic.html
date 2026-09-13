@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>装甲板受击检测节点原理图 — 4×HX711 + STM32F103C8T6</title>
+<style>
+  body{background:#0a0e14;color:#e8f0f8;font-family:"Chakra Petch","Microsoft YaHei",sans-serif;margin:0;padding:24px;}
+  h1{color:#f5c518;font-size:20px;margin:0 0 4px;}
+  h2{color:#35e0ff;font-size:16px;margin:28px 0 8px;}
+  .sub{color:#9fb3c8;font-size:13px;margin-bottom:16px;}
+  svg{background:#0d131c;border:1px solid #263244;border-radius:8px;max-width:100%;height:auto;display:block;}
+  table{border-collapse:collapse;font-size:13px;margin-top:6px;}
+  th,td{border:1px solid #263244;padding:5px 12px;text-align:left;}
+  th{background:#131a24;color:#f5c518;}
+  td.hl{color:#ff5d7a;}
+  code{color:#35e0ff;font-family:Consolas,monospace;}
+  .note{color:#9fb3c8;font-size:12px;}
+</style>
+</head>
+<body>
+<h1>装甲板受击检测节点原理图</h1>
+<div class="sub">4× 薄膜压敏传感器 → 4× HX711 → STM32F103C8T6（I2C2 从机，地址 0x30+ID，ID 由焊盘设定）</div>
+<svg id="sch" viewBox="0 0 1500 990" xmlns="http://www.w3.org/2000/svg"></svg>
+
+<h2>与现有代码（HX711_4ch_Scale）的差异</h2>
+<table>
+  <tr><th>信号</th><th>原引脚</th><th>现引脚</th><th>原因</th></tr>
+  <tr><td>CH4 SCK</td><td>PB10</td><td class="hl">PB12</td><td>腾出 PB10/PB11 给硬件 I2C2（F103 硬件 I2C 仅 PB6/7 与 PB10/11）</td></tr>
+  <tr><td>I2C2 SCL/SDA</td><td>—</td><td class="hl">PB10 / PB11</td><td>作 I2C 从机接口，接主控</td></tr>
+  <tr><td>ID0/ID1/ID2</td><td>—</td><td class="hl">PA0 / PA1 / PA2</td><td>焊盘短接设地址，内部上拉，无需额外芯片</td></tr>
+</table>
+<div class="note">其余引脚（CH1~CH3、串口 PA9/PA10）与 hx711.c 完全一致，仅需在代码中把 CH4 的 SCK 改为 PB12 并新增 I2C2 从机初始化。</div>
+
+<h2>BOM 清单</h2>
+<table>
+  <tr><th>元件</th><th>型号 / 参数</th><th>数量</th><th>说明</th></tr>
+  <tr><td>压敏传感器</td><td>RP-C18.3-ST 薄膜压敏</td><td>4</td><td>贴于装甲板背面 4 象限</td></tr>
+  <tr><td>ADC 模块</td><td>HX711 模块</td><td>4</td><td>统一 3.3V 供电</td></tr>
+  <tr><td>MCU</td><td>STM32F103C8T6（LQFP48）</td><td>1</td><td>硬件 I2C2 从机</td></tr>
+  <tr><td>LDO</td><td>AMS1117-3.3</td><td>1</td><td>5V → 3.3V，IN/OUT 各 10µF</td></tr>
+  <tr><td>配平电阻</td><td>10kΩ（按传感器实测静态阻值调整）</td><td>4</td><td>R1~R4，A- 对地半桥</td></tr>
+  <tr><td>I2C 上拉</td><td>4.7kΩ</td><td>2</td><td>R5/R6</td></tr>
+  <tr><td>晶振</td><td>8MHz + 20pF×2</td><td>1</td><td>Y1、C3/C4</td></tr>
+  <tr><td>ID 焊盘</td><td>3 焊盘 / 跳线</td><td>3</td><td>短接到 GND = 1</td></tr>
+  <tr><td>去耦</td><td>100nF</td><td>若干</td><td>各电源脚</td></tr>
+</table>
+
+<h2>I2C 地址表</h2>
+<table>
+  <tr><th>ID2</th><th>ID1</th><th>ID0</th><th>7 位地址</th></tr>
+  <tr><td>0</td><td>0</td><td>0</td><td>0x30</td></tr>
+  <tr><td>0</td><td>0</td><td>1</td><td>0x31</td></tr>
+  <tr><td>0</td><td>1</td><td>0</td><td>0x32</td></tr>
+  <tr><td>0</td><td>1</td><td>1</td><td>0x33</td></tr>
+  <tr><td>1</td><td>0</td><td>0</td><td>0x34</td></tr>
+  <tr><td>1</td><td>0</td><td>1</td><td>0x35</td></tr>
+  <tr><td>1</td><td>1</td><td>0</td><td>0x36</td></tr>
+  <tr><td>1</td><td>1</td><td>1</td><td>0x37</td></tr>
+</table>
+<div class="note">ID 位定义：焊盘短接到 GND = 1（PA0/PA1/PA2 内部上拉读取）。多块装甲板并联在同一条 I2C 总线上，主控按地址区分。</div>
+
+<script>
+const NS = "http://www.w3.org/2000/svg";
+const svg = document.getElementById("sch");
+let out = [];
+
+const WIRE = "#b8cfe8", YEL = "#f5c518", CYN = "#35e0ff", RED = "#ff5d7a", GRN = "#9be37b", TXT = "#e8f0f8", DIM = "#9fb3c8";
+
+const wire = pts => `<polyline points="${pts.map(p=>p.join(",")).join(" ")}" fill="none" stroke="${WIRE}" stroke-width="1.6"/>`;
+const box = (x,y,w,h,stroke,label,lx,ly,fs=14) =>
+  `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="4" fill="#10161f" stroke="${stroke}" stroke-width="2"/>` +
+  (label ? `<text x="${lx}" y="${ly}" fill="${TXT}" font-size="${fs}" text-anchor="middle" font-family="Consolas,monospace">${label}</text>` : "");
+const txt = (x,y,s,{fill=TXT,size=12,anchor="middle",mono=true,bold=false}={}) =>
+  `<text x="${x}" y="${y}" fill="${fill}" font-size="${size}" text-anchor="${anchor}" ${bold?'font-weight="bold"':""} font-family="${mono?'Consolas,monospace':'sans-serif'}">${s}</text>`;
+const dot = (x,y) => `<circle cx="${x}" cy="${y}" r="3" fill="${WIRE}"/>`;
+const pin = (x,y) => `<circle cx="${x}" cy="${y}" r="2.4" fill="${WIRE}"/>`;
+const gnd = (x,y) => `<g stroke="${WIRE}" stroke-width="1.6"><line x1="${x}" y1="${y}" x2="${x}" y2="${y+7}"/><line x1="${x-8}" y1="${y+7}" x2="${x+8}" y2="${y+7}"/><line x1="${x-5}" y1="${y+11}" x2="${x+5}" y2="${y+11}"/><line x1="${x-2}" y1="${y+15}" x2="${x+2}" y2="${y+15}"/></g>`;
+const resV = (cx,y1,y2,label,lx,anchor) =>
+  wire([[cx,y1],[cx,(y1+y2)/2-16]]) + wire([[cx,(y1+y2)/2+16],[cx,y2]]) +
+  `<rect x="${cx-8}" y="${(y1+y2)/2-16}" width="16" height="32" fill="#10161f" stroke="${WIRE}" stroke-width="1.6"/>` +
+  txt(lx,(y1+y2)/2+4,label,{size:11,anchor});
+
+/* ===== 标题 ===== */
+out.push(txt(760,28,"装甲板受击检测节点原理图",{fill:YEL,size:20,bold:true,mono:false}));
+out.push(txt(760,48,"4× 薄膜压敏 + 4× HX711 + STM32F103C8T6 (I2C2 从机 / ID 焊盘设定)",{fill:DIM,size:12,mono:false}));
+
+/* ===== 装甲板 ===== */
+out.push(`<rect x="60" y="100" width="170" height="770" rx="8" fill="none" stroke="${RED}" stroke-width="1.6" stroke-dasharray="7 5"/>`);
+out.push(txt(145,120,"装甲板（受击面）",{fill:RED,size:13,mono:false}));
+const YC = [180,390,600,810], SN = ["S1","S2","S3","S4"];
+YC.forEach((yc,i)=>{
+  // 传感器本体（可变电阻符号）
+  out.push(`<rect x="100" y="${yc-25}" width="90" height="50" rx="3" fill="#131a24" stroke="${RED}" stroke-width="2"/>`);
+  out.push(`<line x1="${108}" y1="${yc+18}" x2="${182}" y2="${yc-18}" stroke="${RED}" stroke-width="1.3"/>`);
+  out.push(`<polygon points="182,${yc-18} 174,${yc-16} 178,${yc-10}" fill="${RED}"/>`);
+  out.push(txt(145,yc-2,SN[i],{size:13,bold:true}));
+  out.push(txt(145,yc+14,"压敏",{size:10,fill:DIM,mono:false}));
+  out.push(wire([[190,yc-15],[380,yc-15]])); out.push(pin(190,yc-15));
+  out.push(wire([[190,yc+15],[380,yc+15]])); out.push(pin(190,yc+15));
+});
+
+/* ===== HX711 模块 ×4 ===== */
+YC.forEach((yc,i)=>{
+  out.push(box(380,yc-60,190,120,YEL,`HX711 #${i+1}`,475,yc-40,15));
+  // 左侧引脚：E+ / A+ / A-
+  [["E+",yc-15],["A+",yc+15],["A-",yc+45]].forEach(([n,y])=>{
+    out.push(pin(380,y)); out.push(txt(388,y+4,n,{size:11,anchor:"start"}));
+  });
+  // 右侧引脚：DT / SCK
+  [["DT",yc-16],["SCK",yc+16]].forEach(([n,y])=>{
+    out.push(pin(570,y)); out.push(txt(562,y+4,n,{size:11,anchor:"end"}));
+  });
+  // 电源（网络标号形式）
+  out.push(wire([[430,yc-60],[430,yc-76]]));
+  out.push(txt(430,yc-84,"+3.3V",{fill:CYN,size:11}));
+  out.push(wire([[525,yc+60],[525,yc+76]])); out.push(gnd(525,yc+76));
+  // A- 半桥配平电阻 → GND
+  out.push(wire([[380,yc+45],[350,yc+45]]));
+  out.push(`<rect x="310" y="${yc+38}" width="40" height="14" rx="2" fill="#10161f" stroke="${WIRE}" stroke-width="1.6"/>`);
+  out.push(txt(330,yc+66,`R${i+1} 10k`,{size:10,fill:DIM}));
+  out.push(wire([[310,yc+45],[300,yc+45]]));
+  out.push(wire([[300,yc+45],[300,940]]));
+  out.push(dot(300,yc+45));
+});
+
+/* ===== GND 汇流排 ===== */
+out.push(wire([[250,940],[380,940]]));
+out.push(dot(300,940));
+out.push(gnd(315,944));
+out.push(txt(368,958,"GND",{size:12,anchor:"start"}));
+
+/* ===== HX711 → MCU 走线：DT/SCK 各 4 根 ===== */
+// CH1~CH4：DT 车道 620/660/700/740，SCK 车道 640/680/720/760
+const DT_L = [620,660,700,740], CK_L = [640,680,720,760];
+const DT_M = [410,470,530,590], CK_M = [440,500,560,620];
+YC.forEach((yc,i)=>{
+  out.push(wire([[570,yc-16],[DT_L[i],yc-16],[DT_L[i],DT_M[i]],[820,DT_M[i]]]));
+  out.push(wire([[570,yc+16],[CK_L[i],yc+16],[CK_L[i],CK_M[i]],[820,CK_M[i]]]));
+});
+
+/* ===== MCU ===== */
+out.push(box(820,380,210,280,CYN));
+out.push(txt(925,482,"STM32F103",{fill:CYN,size:13,bold:true}));
+out.push(txt(925,497,"C8T6",{fill:CYN,size:13,bold:true}));
+out.push(txt(925,515,"I2C2 从机",{size:10,fill:DIM,mono:false}));
+out.push(txt(925,529,"0x30+ID",{size:10,fill:DIM}));
+out.push(wire([[925,380],[925,362]])); out.push(txt(925,354,"+3.3V",{fill:CYN,size:11}));
+out.push(wire([[925,660],[925,676]])); out.push(gnd(925,676));
+const LPIN = [[410,"DT1 PB0"],[440,"SCK1 PB1"],[470,"DT2 PB5"],[500,"SCK2 PB6"],[530,"DT3 PB7"],[560,"SCK3 PB8"],[590,"DT4 PB9"],[620,"SCK4 PB12"]];
+const RPIN = [[435,"SCL PB10"],[470,"SDA PB11"],[530,"ID0 PA0"],[565,"ID1 PA1"],[600,"ID2 PA2"]];
+LPIN.forEach(([y,n])=>{ out.push(pin(820,y)); out.push(txt(828,y+4,n,{size:11,anchor:"start"})); });
+RPIN.forEach(([y,n])=>{ out.push(pin(1030,y)); out.push(txt(1022,y+4,n,{size:11,anchor:"end"})); });
+
+/* ===== I2C 总线 J1 + 上拉 ===== */
+out.push(wire([[1030,435],[1180,435]]));
+out.push(wire([[1030,470],[1180,470]]));
+out.push(dot(1080,435)); out.push(dot(1130,470));
+out.push(resV(1080,215,435,"R5 4.7k",1064,"end"));
+out.push(txt(1080,205,"+3.3V",{fill:CYN,size:11}));
+out.push(resV(1130,215,470,"R6 4.7k",1146,"start"));
+out.push(txt(1130,205,"+3.3V",{fill:CYN,size:11}));
+out.push(box(1180,360,140,160,GRN));
+out.push(txt(1250,378,"I2C 总线 J1",{fill:GRN,size:13,mono:false}));
+out.push(txt(1250,394,"→ 主控(主机)",{size:10,fill:DIM,mono:false}));
+[["1 +3.3V",400],["2 SCL",435],["3 SDA",470],["4 GND",505]].forEach(([n,y])=>{
+  out.push(pin(1180,y)); out.push(txt(1190,y+4,n,{size:11,anchor:"start"}));
+});
+out.push(wire([[1180,400],[1150,400],[1150,384]])); out.push(txt(1150,376,"+3.3V",{fill:CYN,size:10}));
+out.push(wire([[1180,505],[1150,505],[1150,520]])); out.push(gnd(1150,520));
+
+/* ===== ID 焊盘 ×3 ===== */
+[[530,"ID0"],[565,"ID1"],[600,"ID2"]].forEach(([y,n])=>{
+  out.push(wire([[1030,y],[1140,y]]));
+  out.push(`<rect x="1140" y="${y-15}" width="90" height="30" rx="3" fill="#131a24" stroke="${GRN}" stroke-width="1.6"/>`);
+  out.push(txt(1185,y+4,`${n} 焊盘`,{size:11,mono:false}));
+  out.push(wire([[1230,y],[1265,y],[1265,y+16]])); out.push(gnd(1265,y+16));
+});
+out.push(txt(1185,648,"短接 = 1（内部上拉）→ 地址 0x30+ID",{fill:DIM,size:11,mono:false}));
+
+/* ===== 电源 J2 + LDO ===== */
+out.push(box(1150,90,150,80,GRN));
+out.push(txt(1225,108,"电源输入 J2",{fill:GRN,size:13,mono:false}));
+out.push(pin(1150,130)); out.push(txt(1160,134,"5V",{size:11,anchor:"start"}));
+out.push(pin(1150,160)); out.push(txt(1160,164,"GND",{size:11,anchor:"start"}));
+out.push(wire([[1150,130],[1080,130]]));
+out.push(box(950,100,130,50,"#c9a7ff","AMS1117-3.3",1015,129,12));
+out.push(wire([[950,130],[905,130]]));
+out.push(txt(898,134,"+3.3V",{fill:CYN,size:12,anchor:"end"}));
+out.push(wire([[1015,150],[1015,166]])); out.push(gnd(1015,166));
+out.push(wire([[1150,160],[1150,166]])); out.push(gnd(1150,166));
+out.push(txt(1015,90,"5V→3.3V，IN/OUT 各 10µF",{fill:DIM,size:10,mono:false}));
+
+/* ===== 晶振电路 ===== */
+out.push(wire([[860,660],[860,684]])); out.push(txt(852,676,"PD0",{size:10,anchor:"end",fill:DIM}));
+out.push(wire([[890,660],[890,684]])); out.push(txt(898,676,"PD1",{size:10,anchor:"start",fill:DIM}));
+out.push(`<rect x="858" y="684" width="34" height="30" rx="3" fill="#10161f" stroke="${WIRE}" stroke-width="1.6"/>`);
+out.push(txt(875,703,"Y1 8M",{size:10}));
+out.push(wire([[860,670],[830,670],[830,686]]));
+out.push(`<line x1="824" y1="686" x2="836" y2="686" stroke="${WIRE}" stroke-width="1.8"/><line x1="824" y1="692" x2="836" y2="692" stroke="${WIRE}" stroke-width="1.8"/>`);
+out.push(wire([[830,692],[830,706]])); out.push(gnd(830,706));
+out.push(txt(818,684,"C3 20p",{size:10,anchor:"end",fill:DIM}));
+out.push(wire([[890,670],[920,670],[920,686]]));
+out.push(`<line x1="914" y1="686" x2="926" y2="686" stroke="${WIRE}" stroke-width="1.8"/><line x1="914" y1="692" x2="926" y2="692" stroke="${WIRE}" stroke-width="1.8"/>`);
+out.push(wire([[920,692],[920,706]])); out.push(gnd(920,706));
+out.push(txt(930,684,"C4 20p",{size:10,anchor:"start",fill:DIM}));
+
+/* ===== 设计说明 ===== */
+out.push(`<rect x="580" y="730" width="860" height="205" rx="6" fill="none" stroke="#263244" stroke-dasharray="5 4"/>`);
+out.push(txt(600,752,"设计说明",{fill:YEL,size:13,bold:true,mono:false}));
+const NOTES = [
+ "1. 传感器 S1–S4：RP-C18.3-ST 薄膜压敏（无压 >3MΩ，重压达 kΩ 级），贴于装甲板背面 4 象限",
+ "2. 半桥接法：传感器 → E+ / A+；A- 经 10kΩ 配平电阻接 GND（按实测静态阻值选取）；E- 悬空",
+ "3. HX711 统一 3.3V 供电，DT/SCK 与 MCU 直连（同电平域无需转换）；上电默认 A 通道 ±128 增益",
+ "4. 引脚与 hx711.c 一致；CH4 的 SCK 由 PB10 改为 PB12，腾出 PB10/PB11 作硬件 I2C2 从机",
+ "5. ID 设定：PA0/PA1/PA2 内部上拉，焊盘短接 = 1；7 位地址 = 0x30+ID（8 个，无需任何额外芯片）",
+ "6. 主控作 I2C 主机经 J1 轮询 4 通道原始 AD，超过阈值判受击；多块装甲板并联同一总线",
+ "7. 最小系统：Y1 8MHz + 20pF×2；BOOT0 经 10kΩ 下拉；NRST 10kΩ 上拉 + 100nF；各电源脚 100nF 去耦",
+ "8. ● = 电气连接；导线十字交叉处无圆点 = 不连接；E+/A+ 走线尽量短并远离 SCK"
+];
+NOTES.forEach((s,i)=> out.push(txt(600,774+i*20,s,{fill:DIM,size:12,mono:false,anchor:"start"})));
+
+svg.innerHTML = out.join("");
+</script>
+</body>
+</html>

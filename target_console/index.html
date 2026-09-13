@@ -1,0 +1,1630 @@
+<!DOCTYPE html>
+<!--
+  RM 靶车击打监测与控制台（单文件前端，可直接由泰山派 RK3566 静态托管）
+
+  ═══════════════ WebSocket 通信协议（JSON，一行一条） ═══════════════
+  前端 → 泰山派（命令）：
+    {"cmd":"set_id",     "slot":0, "id":3}                     // 设置第slot块(0~3)装甲板的ID
+    {"cmd":"team",       "value":"red"|"blue"}                   // 红蓝方切换
+    {"cmd":"reset_hits", "slot":0}   / {"cmd":"reset_hits","slot":"all"}   // 清零击打数
+    {"cmd":"move",       "dir":"fwd"|"back"|"stop", "speed":60}  // 限轨移动 speed:0~100
+    {"cmd":"rotate",     "on":true, "dir":"cw"|"ccw", "speed":45} // 旋转台开关/方向/速度0~100
+
+  泰山派 → 前端（数据）：
+    {"type":"adc","slot":0,"ch":[123,-456,789,-12]}             // 四路HX711去皮后原始值，CH1左上 CH2右上 CH3右下 CH4左下
+    {"type":"hit","slot":0,"x":42,"y":70,"n":5}                 // 可选：板端已解算则直接下发命中(x,y为0~100百分比, n为该板累计数)
+    {"type":"state","rotate":{"on":true,"dir":"cw","speed":45}} // 可选：状态回传
+  ═══════════════════════════════════════════════════════════════════
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RM 靶车控制台</title>
+<link href="https://fonts.googleapis.com/css2?family=Michroma&family=Chakra+Petch:wght@400;500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+/* ═══ CYBERPUNK 2077 风格 ═══
+   主色：近黑紫底 + 霓虹黄 #fcee0a / 故障品红 #ff2a6d / 赛博青 #00f0ff
+   阵营色：红方 #ff003c / 蓝方 #00f0ff（通过 --acc 变量整体联动） */
+:root{
+  --bg:#08080e; --bg2:#0e0e18; --panel:#12121e; --panel2:#0c0c16;
+  --line:#262640; --line2:#3a3a5c;
+  --txt:#cfe3ee; --dim:#6b7a94; --faint:#39415c;
+  --acc:#ff003c; --acc-dim:rgba(255,0,60,.12); --acc-glow:rgba(255,0,60,.5);
+  --cy:#00f0ff; --yl:#fcee0a; --mg:#ff2a6d; --gn:#00ff9d;
+  --mono:'Share Tech Mono',ui-monospace,Consolas,monospace;
+  --disp:'Chakra Petch','Noto Sans SC',system-ui,sans-serif;
+  --head:'Michroma','Chakra Petch','Noto Sans SC',sans-serif;
+}
+body.blue{
+  --acc:#00f0ff; --acc-dim:rgba(0,240,255,.10); --acc-glow:rgba(0,240,255,.5);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%}
+body{
+  background:
+    repeating-linear-gradient(0deg,transparent 0 39px,rgba(0,240,255,.035) 39px 40px),
+    repeating-linear-gradient(90deg,transparent 0 39px,rgba(0,240,255,.035) 39px 40px),
+    radial-gradient(1200px 600px at 75% -10%,rgba(90,0,140,.28),transparent 60%),
+    radial-gradient(900px 500px at 10% 110%,rgba(0,120,140,.14),transparent 60%),
+    var(--bg);
+  color:var(--txt); font-family:var(--disp); font-size:15px; letter-spacing:.4px;
+  overflow-x:hidden;
+}
+/* CRT 扫描线 */
+body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:999;
+  background:repeating-linear-gradient(0deg,rgba(0,0,0,.16) 0 2px,transparent 2px 4px);
+  mix-blend-mode:overlay;opacity:.6}
+/* 移动扫描光带 */
+body::before{content:"";position:fixed;left:0;right:0;top:0;height:100vh;pointer-events:none;z-index:998;
+  background:linear-gradient(180deg,transparent 0%,rgba(0,240,255,.05) 48%,rgba(255,42,109,.06) 52%,transparent 100%);
+  animation:scanmove 7s linear infinite}
+@keyframes scanmove{from{transform:translateY(-100%)}to{transform:translateY(100%)}}
+/* glitch 文字（青/品红错位重影） */
+.glitch{position:relative;display:inline-block}
+.glitch::before,.glitch::after{content:attr(data-text);position:absolute;left:0;top:0;
+  pointer-events:none;mix-blend-mode:screen}
+.glitch::before{color:var(--cy);transform:translate(-2px,0);clip-path:inset(0 0 55% 0);
+  animation:gl1 3.4s infinite steps(1)}
+.glitch::after{color:var(--mg);transform:translate(2px,0);clip-path:inset(60% 0 0 0);
+  animation:gl2 2.8s infinite steps(1)}
+@keyframes gl1{0%,91%{opacity:0}92%,96%{opacity:.85}97%,100%{opacity:0}}
+@keyframes gl2{0%,87%{opacity:0}88%,93%{opacity:.85}94%,100%{opacity:0}}
+
+/* ═══ 顶栏 ═══ */
+header{
+  display:flex;align-items:center;gap:18px;flex-wrap:wrap;
+  padding:14px 22px;border-bottom:1px solid var(--cy);
+  background:linear-gradient(180deg,rgba(18,10,32,.85),rgba(8,8,14,.55));
+  position:sticky;top:0;z-index:10;backdrop-filter:blur(6px);
+  box-shadow:0 0 24px -6px rgba(0,240,255,.35);
+}
+header::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:1px;
+  background:linear-gradient(90deg,transparent,var(--mg) 20%,var(--yl) 50%,var(--cy) 80%,transparent);
+  opacity:.8}
+.logo{display:flex;align-items:center;gap:12px}
+.logo .hex{
+  width:40px;height:40px;background:rgba(252,238,10,.10);border:1px solid var(--yl);
+  clip-path:polygon(25% 0,75% 0,100% 50%,75% 100%,25% 100%,0 50%);
+  display:grid;place-items:center;color:var(--yl);font-family:var(--head);font-weight:700;font-size:13px;
+  animation:pulse 3s infinite;
+}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(252,238,10,.5)}50%{box-shadow:0 0 20px 2px rgba(252,238,10,.55)}}
+.logo h1{font-family:var(--head);font-size:19px;letter-spacing:3px;font-weight:700}
+.logo h1 b{color:var(--yl);text-shadow:0 0 12px rgba(252,238,10,.7)}
+.logo small{display:block;font-family:var(--mono);font-size:10px;color:var(--cy);letter-spacing:3px;margin-top:3px}
+.spacer{flex:1}
+
+/* 红蓝切换 */
+/* iOS 分段控件（红蓝 / 兵种切换，滑动 thumb 主题色） */
+.team-switch,.unit-switch{position:relative;display:flex;border-radius:10px;
+  background:rgba(0,0,0,.35);border:1px solid var(--line2);
+  box-shadow:inset 0 1px 4px rgba(0,0,0,.5);overflow:hidden}
+.team-switch button,.unit-switch button{
+  position:relative;z-index:1;background:transparent;border:0;cursor:pointer;
+  font-family:var(--head);letter-spacing:2px;transition:color .25s;
+}
+.team-switch button{font-size:13px;font-weight:600;padding:8px 20px;color:var(--dim)}
+.team-switch button.on{color:#08080e}
+.unit-switch button{font-size:12px;font-weight:600;padding:7px 14px;color:var(--dim)}
+.unit-switch button small{display:block;font-family:var(--mono);font-size:8px;letter-spacing:1px;opacity:.7}
+.unit-switch button.on{color:#08080e}
+.team-switch .seg-thumb{background:linear-gradient(180deg,#ff2a6d,#c2003c);
+  box-shadow:0 0 18px rgba(255,0,60,.55)}
+#teamSwitch:has(button.on[data-team="blue"]) .seg-thumb{
+  background:linear-gradient(180deg,#00f0ff,#0090b0);box-shadow:0 0 18px rgba(0,240,255,.55)}
+.unit-switch .seg-thumb{background:var(--unit-c);box-shadow:0 0 18px var(--unit-glow)}
+.unit-tag{font-family:var(--mono);font-size:11px;color:var(--dim);letter-spacing:1px}
+.unit-tag b{color:var(--unit-c);font-family:var(--head);letter-spacing:2px}
+body[data-unit="infantry"]{--unit-c:#00f0ff;--unit-glow:rgba(0,240,255,.5);--mk3:block;--mk1:none;--emD:block;--emS:none;--mk:"3"}
+body[data-unit="sentry"]{--unit-c:#fcee0a;--unit-glow:rgba(252,238,10,.5);--mk3:none;--mk1:none;--emD:none;--emS:block;--mk:""}
+body[data-unit="heavy"]{--unit-c:#ff2a6d;--unit-glow:rgba(255,42,109,.5);--mk3:none;--mk1:block;--emD:block;--emS:none;--mk:"1"}
+/* 兵种专属编号/图案（官方装甲贴纸：步兵3号、哨兵机器人剪影、英雄/重装1号） */
+.plate .unit-mark{font-family:var(--head);font-weight:700;font-size:36px;text-anchor:middle;
+  fill:var(--yl);opacity:.9;filter:drop-shadow(0 0 6px rgba(252,238,10,.65))}
+.plate .m3{display:var(--mk3)}
+.plate .m1{display:var(--mk1)}
+/* 哨兵官方剪影：白色图案（附录图5），头身+炮管+梯形底座 */
+.plate .em-sentry{display:var(--emS);fill:none;stroke:#fff;stroke-linejoin:round;
+  filter:drop-shadow(0 0 5px rgba(255,255,255,.5))}
+.plate .es-head{stroke-width:2.6}
+.plate .es-base{stroke-width:3}
+.plate .es-neck{fill:#fff;stroke:none;opacity:.95}
+
+/* 连接区 */
+.conn{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12px}
+.conn input{
+  width:190px;background:var(--panel2);border:1px solid var(--line2);color:var(--cy);
+  padding:7px 10px;font-family:var(--mono);font-size:12px;outline:none;
+  clip-path:polygon(6px 0,100% 0,100% calc(100% - 6px),calc(100% - 6px) 100%,0 100%,0 6px);
+}
+.conn input:focus{border-color:var(--cy);box-shadow:0 0 10px rgba(0,240,255,.4)}
+.btn{
+  background:var(--panel);border:1px solid var(--line2);color:var(--txt);
+  font-family:var(--head);font-weight:600;letter-spacing:1px;font-size:12px;
+  padding:8px 16px;cursor:pointer;transition:all .2s;
+  clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%,0 8px);
+}
+.btn:hover{border-color:var(--cy);color:var(--cy);box-shadow:0 0 14px -2px rgba(0,240,255,.6)}
+.btn.acc{background:rgba(252,238,10,.10);border-color:var(--yl);color:var(--yl)}
+.btn.acc:hover{background:var(--yl);color:#08080e;box-shadow:0 0 18px rgba(252,238,10,.6)}
+.btn:disabled{opacity:.35;cursor:not-allowed}
+.dot{width:9px;height:9px;border-radius:50%;background:#3a3a5c;flex:none}
+.dot.on{background:var(--gn);box-shadow:0 0 10px var(--gn);animation:blink 2s infinite}
+.dot.err{background:var(--mg);box-shadow:0 0 10px var(--mg)}
+@keyframes blink{50%{opacity:.5}}
+
+/* ═══ 主布局 ═══ */
+main{
+  display:grid;grid-template-columns:1fr 340px;gap:16px;
+  padding:16px 22px;max-width:1600px;margin:0 auto;
+}
+@media(max-width:1100px){main{grid-template-columns:1fr}}
+.panel{
+  background:linear-gradient(160deg,var(--panel),var(--panel2));
+  border:1px solid var(--line);position:relative;
+  clip-path:polygon(14px 0,100% 0,100% calc(100% - 14px),calc(100% - 14px) 100%,0 100%,0 14px);
+}
+.panel::before{content:"";position:absolute;top:0;left:0;width:26px;height:2px;background:var(--yl)}
+.panel::after{content:"";position:absolute;bottom:0;right:0;width:26px;height:2px;background:var(--mg)}
+.p-head{
+  display:flex;align-items:center;gap:10px;padding:11px 14px;
+  border-bottom:1px solid var(--line);
+  font-family:var(--head);font-size:13px;font-weight:700;letter-spacing:3px;
+  text-shadow:0 0 10px rgba(0,240,255,.25);
+}
+.p-head .tag{font-family:var(--mono);font-size:10px;color:var(--cy);letter-spacing:1px;
+  border:1px solid rgba(0,240,255,.4);background:rgba(0,240,255,.07);padding:2px 7px;
+  clip-path:polygon(5px 0,100% 0,100% calc(100% - 5px),calc(100% - 5px) 100%,0 100%,0 5px)}
+.p-body{padding:14px}
+
+/* ═══ 装甲板网格 ═══ */
+.armors{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+@media(max-width:760px){.armors{grid-template-columns:1fr}}
+.armor{
+  background:var(--panel2);border:1px solid var(--line);padding:12px;
+  position:relative;transition:border-color .3s,box-shadow .3s;
+  clip-path:polygon(10px 0,100% 0,100% calc(100% - 10px),calc(100% - 10px) 100%,0 100%,0 10px);
+}
+.armor.recent{border-color:var(--acc);box-shadow:0 0 26px -4px var(--acc-glow),inset 0 0 20px -10px var(--acc-glow)}
+.a-top{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.a-top .slot{font-family:var(--mono);font-size:11px;color:var(--dim);letter-spacing:1px}
+.a-top .slot b{color:var(--yl);font-size:14px;text-shadow:0 0 8px rgba(252,238,10,.6)}
+.a-top input{
+  width:56px;background:var(--bg);border:1px solid var(--line2);color:var(--acc);
+  font-family:var(--mono);font-size:15px;text-align:center;padding:4px 2px;outline:none;
+}
+.a-top input:focus{border-color:var(--acc);box-shadow:0 0 10px var(--acc-glow)}
+.a-top .cnt{margin-left:auto;text-align:right;line-height:1}
+.a-top .cnt i{font-style:normal;font-family:var(--head);font-size:9px;color:var(--dim);letter-spacing:2px;display:block}
+.a-top .cnt b{font-family:var(--mono);font-size:26px;color:var(--acc);
+  text-shadow:0 0 14px var(--acc-glow)}
+.a-top .rst{
+  background:transparent;border:1px solid var(--line2);color:var(--dim);cursor:pointer;
+  font-size:11px;font-family:var(--disp);padding:4px 8px;letter-spacing:1px;transition:all .2s;
+}
+.a-top .rst:hover{border-color:var(--mg);color:var(--mg);box-shadow:0 0 10px rgba(255,42,109,.5)}
+
+/* 装甲板 SVG（官方小装甲板：八边形轮廓 + 左右竖直灯条 + 印刷纹样） */
+.plate-wrap{display:flex;justify-content:center;background:
+  radial-gradient(closest-side,rgba(0,240,255,.07),transparent) ,var(--bg);
+  border:1px solid var(--line);padding:6px;position:relative;overflow:hidden}
+
+/* ═══ 兵种/阵营切换特效：参考超抗飞镖命中末端移动靶（扫光横扫 + 冲击波双环 + 纹样重铸） ═══
+   --fx-c 由 unit-fx(兵种色) / team-fx(阵营色) 注入 */
+.armor.unit-fx{--fx-c:var(--unit-c)}
+.armor.team-fx{--fx-c:var(--acc)}
+.uwave{position:absolute;inset:0;pointer-events:none;display:none;z-index:5}
+.armor.unit-fx .uwave{display:block}
+.uwave i{position:absolute;top:-20%;bottom:-20%;width:16%;opacity:0;
+  background:linear-gradient(90deg,transparent,var(--fx-c,var(--unit-c)) 50%,transparent);
+  filter:blur(5px);transform:skewX(-16deg)}
+.armor.unit-fx .uwave i{animation:uSweep .68s ease-out forwards}
+.armor.unit-fx .uwave i:nth-child(2){animation-delay:.13s;filter:blur(10px)}
+@keyframes uSweep{0%{left:-22%;opacity:0} 14%{opacity:.95} 82%{opacity:.6} 100%{left:112%;opacity:0}}
+/* 冲击波双环（由弹着点样式扩散） */
+.plate .uf-ring{fill:none;stroke:var(--fx-c,var(--unit-c));opacity:0;display:none;
+  transform-box:fill-box;transform-origin:center}
+.armor.unit-fx .plate .uf-ring{display:block;animation:uRing .8s .08s ease-out}
+.armor.unit-fx .plate .uf-ring.r2{animation-delay:.24s}
+@keyframes uRing{0%{opacity:.95;stroke-width:3.4;transform:scale(.35)}
+  70%{opacity:.55} 100%{opacity:0;stroke-width:.6;transform:scale(2.3)}}
+/* 纹样重铸：新编号/图案如命中后重新点亮 */
+.armor.unit-fx .unit-mark,.armor.unit-fx .em-sentry,.armor.unit-fx .em-d{
+  animation:uReforge .62s .14s both;transform-box:fill-box;transform-origin:center}
+@keyframes uReforge{0%{opacity:0;transform:scale(1.85);filter:blur(5px)}
+  55%{opacity:1;transform:scale(.94);filter:none} 76%{transform:scale(1.06)} 100%{transform:scale(1)}}
+/* 外壳命中闪白 */
+.armor.unit-fx .shell{animation:uShell .7s ease-out}
+@keyframes uShell{0%,34%{stroke:var(--fx-c,var(--unit-c));stroke-width:2.8;
+  filter:drop-shadow(0 0 10px var(--fx-c,var(--unit-c)))} 100%{filter:none}}
+
+/* ═══ 红蓝切换专属特效：数字重同步（区别于兵种切换的命中系特效）
+   屏幕边缘辉光脉冲 + 板面故障抖动 + 细扫描线掠过 + 灯条弹性充起 + 流光奔跑 ═══ */
+body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:2999;opacity:0;
+  box-shadow:inset 0 0 150px -40px var(--acc-glow), inset 0 0 26px -14px var(--acc-glow)}
+body.team-fx::before{animation:teamEdge .9s ease-out}
+@keyframes teamEdge{0%{opacity:0} 22%{opacity:1} 100%{opacity:0}}
+/* 板面故障抖动（重同步瞬间的信号错位） */
+.armor.team-fx .plate{animation:plateGlitch .45s steps(1,end) both}
+@keyframes plateGlitch{0%{transform:translate(-4px,2px) skewX(3deg)}
+  30%{transform:translate(3px,-1px) skewX(-2deg)} 62%{transform:translate(-2px,0)} 100%{transform:none}}
+/* 细扫描线单次掠过 */
+.twash{position:absolute;inset:0;display:none;z-index:4;pointer-events:none;opacity:0;
+  background:linear-gradient(to bottom,transparent 0%,var(--acc-glow) 46%,#fff 50%,var(--acc-glow) 54%,transparent 100%)}
+.armor.team-fx .twash{display:block;animation:tScan .62s .06s ease-in-out both}
+@keyframes tScan{0%{transform:translateY(-102%);opacity:0} 18%{opacity:.95}
+  85%{opacity:.55} 100%{transform:translateY(102%);opacity:0}}
+/* 灯条弹性充起（储能后弹至满高） */
+.armor.team-fx .lbar{animation:tBarPop .6s cubic-bezier(.34,1.56,.4,1) both;
+  transform-box:fill-box;transform-origin:center}
+@keyframes tBarPop{0%{transform:scaleY(.18);opacity:.35} 55%{transform:scaleY(1.22);opacity:1}
+  100%{transform:scaleY(1);opacity:1}}
+.plate .lbar{transition:fill .35s}
+/* 灯条流光充能：亮段沿灯条奔跑（左条上行、右条下行） */
+.plate .lb-streak{fill:#fff;opacity:0;pointer-events:none;mix-blend-mode:screen;
+  filter:drop-shadow(0 0 4px var(--acc)) drop-shadow(0 0 9px var(--acc-glow));
+  transform:translateY(0)}
+.armor.team-fx .plate .lb-streak{animation:tStreak .9s cubic-bezier(.45,0,.4,1) both}
+.armor.team-fx .plate .lb-streak.rv{animation-name:tStreakRv;animation-delay:.08s}
+@keyframes tStreak{0%{opacity:0;transform:translateY(62px)} 14%{opacity:.95}
+  72%{opacity:.85} 100%{opacity:0;transform:translateY(-2px)}}
+@keyframes tStreakRv{0%{opacity:0;transform:translateY(-2px)} 14%{opacity:.95}
+  72%{opacity:.85} 100%{opacity:0;transform:translateY(62px)}}
+/* 斜视 3D 板灯条同款流光 */
+.plate3d i::after{content:"";position:absolute;left:-1px;right:-1px;top:100%;height:38%;
+  border-radius:2px;background:#fff;opacity:0;mix-blend-mode:screen;
+  filter:drop-shadow(0 0 3px var(--acc)) drop-shadow(0 0 7px var(--acc-glow))}
+.plate3d.team-fx i::after{animation:tStreak3 .9s cubic-bezier(.45,0,.4,1) both}
+.plate3d.team-fx i:last-of-type::after{animation-name:tStreak3Rv;animation-delay:.08s}
+@keyframes tStreak3{0%{opacity:0;top:96%} 14%{opacity:.95} 72%{opacity:.85} 100%{opacity:0;top:-44%}}
+@keyframes tStreak3Rv{0%{opacity:0;top:-44%} 14%{opacity:.95} 72%{opacity:.85} 100%{opacity:0;top:96%}}
+/* 斜视 3D 板：兵种切换仍用扫光，红蓝切换用能量液 */
+.plate3d{overflow:hidden;--fx-c:var(--unit-c)}
+.plate3d .uwave3{position:absolute;inset:0;display:none;z-index:4;pointer-events:none;
+  background:linear-gradient(115deg,transparent 32%,var(--fx-c,var(--unit-c)) 50%,transparent 68%);
+  background-size:260% 100%;background-position:130% 0;opacity:.85}
+.plate3d.unit-fx .uwave3{display:block;animation:uSweep3 .66s ease-out both}
+@keyframes uSweep3{0%{background-position:135% 0} 100%{background-position:-135% 0}}
+.plate3d.unit-fx::after,.plate3d.unit-fx .s3d{animation:uReforge .6s .12s both;transform-box:fill-box;transform-origin:center}
+.plate3d.unit-fx{animation:uGlow3 .7s ease-out}
+@keyframes uGlow3{0%,30%{box-shadow:0 0 14px 0 var(--fx-c,var(--unit-glow))} 100%{}}
+.plate3d.team-fx .uwave3{display:block;opacity:0;transform:none;background-size:100% 100%;background-position:0 0;
+  background:repeating-linear-gradient(0deg,var(--acc-glow) 0 3px,transparent 3px 8px);
+  animation:tGlitch3 .5s steps(2,end) both}
+@keyframes tGlitch3{0%{opacity:.6} 45%{opacity:.08} 70%{opacity:.42} 100%{opacity:0}}
+/* 俯视迷你板：兵种脉冲 / 阵营脉冲 */
+.model.unit-fx{--fx-c:var(--unit-c)}
+.model.team-fx{--fx-c:var(--acc)}
+.model.unit-fx .mp,.model.team-fx .mp{animation:uMini .8s ease-out}
+@keyframes uMini{0%,35%{filter:drop-shadow(0 0 7px var(--fx-c,var(--unit-c)))} 100%{filter:none}}
+
+/* 俯视/斜视切换：信号重捕获（闪烁+亮度冲击+回弹） */
+.vswap{animation:viewIn .58s cubic-bezier(.2,.8,.3,1) both}
+@keyframes viewIn{0%{opacity:0;transform:scale(.94) translateY(8px)}
+  28%{opacity:1;filter:brightness(2.4) contrast(1.35)}
+  42%{opacity:.45;filter:brightness(1)}
+  58%{opacity:1;filter:brightness(1.5)}
+  100%{opacity:1;transform:none;filter:none}}
+svg.plate{width:100%;max-width:280px;display:block}
+.plate .shell{fill:rgba(20,20,40,.55);stroke:var(--cy);stroke-width:1.6;opacity:.95}
+.plate .inner{fill:none;stroke:rgba(0,240,255,.28);stroke-width:1;stroke-dasharray:4 3}
+.plate .lbar{fill:var(--acc);filter:drop-shadow(0 0 4px var(--acc-glow)) drop-shadow(0 0 10px var(--acc-glow))}
+.plate .lbar-core{fill:#fff;opacity:.85}
+.plate .pat{fill:none;stroke:var(--yl);stroke-width:2;opacity:.5;stroke-linejoin:round}
+.plate .pat2{fill:none;stroke:rgba(0,240,255,.4);stroke-width:1.2}
+.plate .sen{fill:var(--faint)}
+.plate .sen.act{fill:var(--yl);filter:drop-shadow(0 0 5px rgba(252,238,10,.9))}
+.plate text{font-family:var(--mono);fill:var(--cy);font-size:9px}
+.plate .hit-x{stroke:var(--mg);stroke-width:2.5;stroke-linecap:round;
+  filter:drop-shadow(0 0 5px var(--mg))}
+.plate .hit-ring{fill:none;stroke:var(--mg);stroke-width:1.5;opacity:.85}
+.plate .ripple{fill:none;stroke:var(--mg);stroke-width:2;
+  transform-box:fill-box;transform-origin:center;animation:rip .45s ease-out forwards}
+@keyframes rip{from{transform:scale(.2);opacity:.9}to{transform:scale(2.6);opacity:0}}
+.plate .cross{stroke:var(--mg);stroke-width:1;opacity:.7}
+.plate .latest-lb{fill:var(--yl);font-size:10px}
+
+/* 四通道条 */
+.ch-bars{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px}
+.chb{display:flex;flex-direction:column;gap:3px;align-items:center}
+.chb .lb{font-family:var(--mono);font-size:9px;color:var(--dim)}
+.chb .bar{width:100%;height:6px;background:var(--bg);border:1px solid var(--line);position:relative;overflow:hidden}
+.chb .bar i{position:absolute;inset:0;right:auto;width:0%;
+  background:linear-gradient(90deg,var(--cy),var(--acc));transition:width .3s,background .3s}
+.chb .bar i.hot{background:linear-gradient(90deg,var(--yl),var(--mg))}
+.a-foot{display:flex;justify-content:space-between;align-items:center;margin-top:10px;
+  font-family:var(--mono);font-size:11px;color:var(--dim)}
+.a-foot .pos b{color:var(--yl)}
+.a-foot .spread b{color:var(--gn)}
+
+/* ═══ 右列：控制 ═══ */
+.right{display:flex;flex-direction:column;gap:16px;align-content:start}
+.ctl-row{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.ctl-lb{font-family:var(--head);font-size:12px;font-weight:600;letter-spacing:2px;color:var(--cy);min-width:64px}
+/* iOS 分段控件（方向按钮组 / 俯视斜视页签共用，含滑动 thumb） */
+.dir-btns,.vtabs{position:relative;display:flex;border-radius:9px;
+  background:rgba(0,0,0,.35);border:1px solid var(--line2);
+  box-shadow:inset 0 1px 4px rgba(0,0,0,.5);overflow:hidden}
+.seg-thumb{position:absolute;top:3px;bottom:3px;left:0;width:0;border-radius:6px;
+  background:var(--acc-dim);
+  box-shadow:0 0 12px -3px var(--acc-glow),inset 0 0 10px -5px var(--acc-glow);
+  transition:transform .42s cubic-bezier(.32,.72,0,1),width .42s cubic-bezier(.32,.72,0,1),
+    background .35s,box-shadow .35s;
+  will-change:transform,width}
+.dir-btns button{
+  flex:1;position:relative;z-index:1;background:transparent;border:0;color:var(--dim);cursor:pointer;
+  font-family:var(--disp);font-weight:600;font-size:14px;padding:8px 14px;
+  letter-spacing:1px;transition:color .25s,text-shadow .25s;white-space:nowrap;
+}
+.dir-btns button.on{color:var(--acc);text-shadow:0 0 8px var(--acc-glow)}
+.dir-btns button:hover:not(.on){color:var(--yl)}
+.slider-row{display:flex;align-items:center;gap:10px}
+.slider-row input[type=range]{flex:1;-webkit-appearance:none;appearance:none;height:4px;border-radius:2px;
+  background:linear-gradient(90deg,var(--acc) var(--p,50%),var(--line2) var(--p,50%));outline:none;cursor:pointer;
+  box-shadow:0 0 8px -2px var(--acc-glow)}
+.slider-row input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;height:22px;
+  border-radius:50%;background:#fff;cursor:grab;border:0;
+  box-shadow:0 1px 4px rgba(0,0,0,.55),0 0 12px -3px var(--acc-glow);
+  transition:transform .18s cubic-bezier(.32,.72,0,1),box-shadow .18s}
+.slider-row input[type=range]:active::-webkit-slider-thumb{transform:scale(1.12);cursor:grabbing;
+  box-shadow:0 1px 6px rgba(0,0,0,.6),0 0 16px -2px var(--acc-glow)}
+.slider-row .val{font-family:var(--mono);font-size:14px;color:var(--yl);min-width:52px;text-align:right;
+  text-shadow:0 0 8px rgba(252,238,10,.5)}
+/* iOS 拨动开关 */
+.switch{position:relative;width:51px;height:31px;cursor:pointer;flex:none}
+.switch input{opacity:0;width:0;height:0}
+.switch .tr{position:absolute;inset:0;border-radius:16px;
+  background:rgba(120,120,128,.32);border:1px solid var(--line2);
+  box-shadow:inset 0 1px 3px rgba(0,0,0,.35);
+  transition:background .3s,border-color .3s,box-shadow .3s}
+.switch .tr::before{content:"";position:absolute;top:2px;left:2px;width:25px;height:25px;border-radius:50%;
+  background:#fff;box-shadow:0 2px 5px rgba(0,0,0,.45);
+  transition:transform .42s cubic-bezier(.32,.72,0,1),background .3s,box-shadow .3s}
+.switch input:checked+.tr{border-color:var(--acc);background:var(--acc-dim);
+  box-shadow:0 0 14px -3px var(--acc-glow),inset 0 0 10px -5px var(--acc-glow)}
+.switch input:checked+.tr::before{transform:translateX(20px);background:var(--acc);
+  box-shadow:0 2px 5px rgba(0,0,0,.35),0 0 12px var(--acc-glow)}
+
+/* 轨道可视化 */
+.rail-vis{height:34px;margin:4px 0 14px;position:relative}
+.rail-vis .track{position:absolute;left:0;right:0;top:15px;height:4px;
+  background:repeating-linear-gradient(90deg,var(--cy) 0 10px,transparent 10px 16px);opacity:.55}
+.rail-vis .car{position:absolute;top:4px;width:26px;height:26px;left:calc(50% - 13px);
+  background:var(--acc-dim);border:1px solid var(--acc);
+  clip-path:polygon(20% 0,80% 0,100% 50%,80% 100%,20% 100%,0 50%);
+  transition:left .6s linear;display:grid;place-items:center;
+  box-shadow:0 0 14px -2px var(--acc-glow)}
+.rail-vis .car::after{content:"";width:8px;height:8px;background:var(--yl);
+  clip-path:polygon(0 0,100% 50%,0 100%);transform:rotate(90deg)}
+.rail-vis.mv-fwd .car::after{transform:rotate(90deg)}
+.rail-vis.mv-back .car::after{transform:rotate(-90deg)}
+
+/* 旋转可视化 */
+.rot-vis{display:flex;align-items:center;gap:16px;margin:4px 0 14px}
+.rot-disc{width:72px;height:72px;flex:none;border-radius:50%;position:relative;
+  border:1px dashed var(--cy);box-shadow:inset 0 0 16px -8px var(--cy)}
+.rot-disc::before{content:"";position:absolute;inset:6px;border-radius:50%;
+  border:1px solid var(--acc-dim)}
+.rot-disc .blade{position:absolute;left:50%;top:50%;width:30px;height:3px;
+  background:var(--acc);transform-origin:0 50%;box-shadow:0 0 8px var(--acc-glow)}
+.rot-disc.spin .blade{animation:spin var(--dur,3s) linear infinite}
+.rot-disc.spin.rev .blade{animation-direction:reverse}
+@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+.rot-info{font-family:var(--mono);font-size:11px;color:var(--dim);line-height:1.8}
+.rot-info b{color:var(--yl);font-size:13px;text-shadow:0 0 8px rgba(252,238,10,.5)}
+
+/* 实时俯视模型 */
+.model{width:100%;display:block}
+.model .mp{transition:filter .15s}
+.model .mp.hit{filter:drop-shadow(0 0 7px var(--mg)) drop-shadow(0 0 3px var(--mg))}
+.model .mhit{fill:var(--mg);filter:drop-shadow(0 0 4px var(--mg));display:none}
+.model .track{stroke:var(--cy);stroke-width:4;stroke-dasharray:9 6;opacity:.6}
+.model .stop{stroke:var(--mg);stroke-width:2.5;opacity:.85}
+.model .chassis{fill:rgba(20,20,40,.5);stroke:var(--cy);stroke-width:1.5}
+.model .wheel{fill:var(--faint)}
+.model .hub{fill:var(--bg);stroke:var(--yl);stroke-width:1.5}
+.model .spinmark{stroke:var(--yl);stroke-width:2;stroke-linecap:round}
+/* 迷你装甲板：与上方监测板同款（八边形+双侧灯条+菱形徽标+纹样）
+   注意：样式内联于 #armorMini，因为 <use> 影子内容不受文档选择器匹配 */
+
+/* 斜视 3D 模型（CSS preserve-3d 透视）
+   页签 .vtabs 样式复用上方 iOS 分段控件（.dir-btns 共用） */
+.vtabs .vt{position:relative;z-index:1;background:transparent;border:0;color:var(--dim);cursor:pointer;
+  font-family:var(--disp);font-weight:600;font-size:12px;letter-spacing:1px;padding:4px 12px;
+  transition:color .25s,text-shadow .25s}
+.vtabs .vt.on{color:var(--acc);text-shadow:0 0 8px var(--acc-glow)}
+.vtabs .vt:hover:not(.on){color:var(--yl)}
+.scene3d{height:210px;position:relative;perspective:900px;overflow:hidden;
+  border:1px solid var(--line);background:
+  radial-gradient(closest-side,rgba(0,240,255,.09),transparent),
+  repeating-linear-gradient(0deg,transparent 0 19px,rgba(0,240,255,.05) 19px 20px),
+  repeating-linear-gradient(90deg,transparent 0 19px,rgba(255,42,109,.04) 19px 20px),
+  var(--bg)}
+.tilt{position:absolute;left:50%;top:60%;transform-style:preserve-3d;transform:rotateX(58deg)}
+.tilt,.body3d,.spin3d{transform-style:preserve-3d}
+.body3d,.spin3d{position:absolute;left:0;top:0}
+.tilt>div,.body3d>div,.spin3d>div{position:absolute;left:0;top:0}
+.rail3d{width:290px;height:10px;transform:translate3d(-145px,-5px,0);
+  background:repeating-linear-gradient(90deg,var(--cy) 0 10px,transparent 10px 16px);opacity:.55}
+.stop3d{width:6px;height:24px;background:var(--mg);opacity:.85;box-shadow:0 0 8px rgba(255,42,109,.7)}
+.stop3d.l{transform:translate3d(-143px,-12px,13px) rotateX(-90deg)}
+.stop3d.r{transform:translate3d(137px,-12px,13px) rotateX(-90deg)}
+.wall3d{background:rgba(24,24,48,.85);border:1px solid var(--cy)}
+.wall3d.wf{width:64px;height:12px;transform:translate3d(-32px,16px,6px) rotateX(-90deg)}
+.wall3d.wb{width:64px;height:12px;transform:translate3d(-32px,-28px,6px) rotateX(-90deg)}
+.wall3d.wr{width:44px;height:12px;transform:translate3d(10px,-6px,6px) rotateZ(90deg) rotateX(-90deg)}
+.wall3d.wl{width:44px;height:12px;transform:translate3d(-54px,-6px,6px) rotateZ(90deg) rotateX(-90deg)}
+.ctop3d{width:64px;height:44px;background:linear-gradient(160deg,rgba(0,240,255,.14),rgba(20,20,40,.9));
+  border:1px solid var(--cy);transform:translate3d(-32px,-22px,12px)}
+.wheel3d{width:10px;height:10px;border-radius:50%;border:1px solid var(--mg);
+  background:radial-gradient(circle at 35% 35%,#2a2a4a,#0c0c16 70%)}
+.wheel3d.a{transform:translate3d(15px,11px,5px) rotateX(90deg)}
+.wheel3d.b{transform:translate3d(-25px,11px,5px) rotateX(90deg)}
+.wheel3d.c{transform:translate3d(15px,-21px,5px) rotateX(90deg)}
+.wheel3d.d{transform:translate3d(-25px,-21px,5px) rotateX(90deg)}
+.hub3d{width:16px;height:16px;border-radius:50%;background:var(--bg);
+  border:1.5px solid var(--yl);box-shadow:0 0 12px rgba(252,238,10,.8);
+  transform:translate3d(-8px,-8px,13px)}
+/* 3D 装甲板：与上方监测板同款（八边形+双侧灯条+菱形徽标+斜线翼纹样） */
+.plate3d{width:26px;height:30px;background:var(--cy);
+  clip-path:polygon(14.3% 0,85.7% 0,100% 17.4%,100% 82.6%,85.7% 100%,14.3% 100%,0 82.6%,0 17.4%);
+  box-shadow:0 0 10px -2px var(--acc-glow)}
+.plate3d::before{content:"";position:absolute;inset:1px;
+  /* 内层板面：与外壳同形状内缩1px，形成霓虹描边 */
+  clip-path:polygon(14.3% 0,85.7% 0,100% 17.4%,100% 82.6%,85.7% 100%,14.3% 100%,0 82.6%,0 17.4%);
+  background:
+    linear-gradient(45deg,transparent 46%,rgba(0,240,255,.35) 47% 53%,transparent 54%) 50% 50%/100% 100% no-repeat,
+    linear-gradient(160deg,rgba(0,240,255,.16),rgba(0,0,0,.55)),rgba(24,24,48,.9)}
+.plate3d i{position:absolute;width:2.5px;height:58%;top:21%;border-radius:1px;z-index:2;
+  background:var(--acc);box-shadow:0 0 8px var(--acc-glow)}
+.plate3d i:first-of-type{left:1.5px}
+.plate3d i:last-of-type{right:1.5px}
+.plate3d::after{content:var(--mk);position:absolute;left:50%;top:50%;z-index:2;
+  transform:translate(-50%,-50%);
+  font-family:var(--head);font-weight:700;font-size:11px;line-height:1;color:var(--yl);
+  text-shadow:0 0 6px rgba(252,238,10,.8)}
+/* 哨兵官方剪影（斜视迷你版） */
+.plate3d .s3d{display:none;position:absolute;left:50%;top:50%;width:14px;height:16px;
+  transform:translate(-50%,-50%);z-index:2;overflow:visible}
+body[data-unit="sentry"] .plate3d .s3d{display:block}
+.plate3d .s3d path{fill:none;stroke:#fff;stroke-width:4.5;stroke-linejoin:round;
+  filter:drop-shadow(0 0 2px rgba(255,255,255,.6))}
+.plate3d .s3d rect{fill:#fff}
+.plate3d.pf{transform:translate3d(-13px,21px,20px) rotateX(-90deg)}
+.plate3d.pb{transform:translate3d(-13px,-51px,20px) rotateX(-90deg)}
+.plate3d.pr{transform:translate3d(23px,-15px,20px) rotateZ(90deg) rotateX(-90deg)}
+.plate3d.pl{transform:translate3d(-49px,-15px,20px) rotateZ(90deg) rotateX(-90deg)}
+/* 斜视受击：命中点 + 整板品红闪烁 */
+.plate3d .phit{position:absolute;width:5px;height:5px;border-radius:50%;z-index:3;
+  background:var(--mg);box-shadow:0 0 6px var(--mg),0 0 12px var(--mg);
+  transform:translate(-50%,-50%);display:none}
+.plate3d.hit{background:var(--mg)!important}
+.plate3d.hit::before{background:
+    linear-gradient(45deg,transparent 46%,rgba(255,42,109,.5) 47% 53%,transparent 54%) 50% 50%/100% 100% no-repeat,
+    linear-gradient(165deg,rgba(255,42,109,.4),rgba(0,0,0,.55)),rgba(48,12,30,.92)!important}
+
+/* 日志 */
+.log{height:150px;overflow-y:auto;font-family:var(--mono);font-size:11px;
+  padding:8px 12px;line-height:1.9;
+  background:linear-gradient(90deg,rgba(0,240,255,.03),transparent 30%)}
+.log::-webkit-scrollbar{width:4px}
+.log::-webkit-scrollbar-thumb{background:var(--cy)}
+.log .t{color:var(--faint)}
+.log .ok{color:var(--gn);text-shadow:0 0 6px rgba(0,255,157,.6)}
+.log .in{color:var(--yl);text-shadow:0 0 6px rgba(252,238,10,.6)}
+.log .er{color:var(--mg);text-shadow:0 0 6px rgba(255,42,109,.6)}
+.log .dm{color:var(--cy)}
+
+footer{padding:10px 22px 20px;text-align:center;font-family:var(--mono);
+  font-size:10px;color:var(--dim);letter-spacing:2px}
+footer b{color:var(--yl)}
+
+/* ═══ 散布分析弹窗（iOS 底部卡片 Sheet 风格） ═══ */
+.mask{position:fixed;inset:0;background:rgba(0,0,0,.45);backdrop-filter:blur(2px);
+  z-index:1000;display:flex;align-items:flex-end;justify-content:center;
+  opacity:0;visibility:hidden;transition:opacity .38s ease,visibility .38s}
+.mask.open{opacity:1;visibility:visible}
+.dlg{position:relative;width:min(1080px,100%);max-height:92vh;overflow-y:auto;
+  background:linear-gradient(160deg,var(--panel),var(--panel2));
+  border:1px solid var(--line2);border-bottom:0;
+  border-radius:18px 18px 0 0;box-shadow:0 -12px 50px -12px rgba(0,0,0,.8);
+  transform:translateY(100%);transition:transform .46s cubic-bezier(.32,.72,0,1)}
+.mask.open .dlg{transform:translateY(0)}
+/* iOS 抓取条 */
+.dlg::before{content:"";position:sticky;top:8px;z-index:5;display:block;
+  width:44px;height:5px;margin:8px auto 2px;border-radius:3px;
+  background:rgba(255,255,255,.32)}
+/* iOS 卡片化：弹窗打开时背景页面缩小下沉 */
+header,main{transition:transform .46s cubic-bezier(.32,.72,0,1);transform-origin:center top}
+body.sheet-open header,body.sheet-open main{
+  transform:scale(.93) translateY(10px);border-radius:14px;overflow:hidden}
+.dlg-head{display:flex;align-items:center;gap:10px;padding:13px 16px;border-bottom:1px solid var(--line);
+  font-family:var(--head);font-size:14px;font-weight:700;letter-spacing:3px}
+.dlg-head .tag{font-family:var(--mono);font-size:10px;color:var(--cy);letter-spacing:1px;
+  border:1px solid rgba(0,240,255,.4);background:rgba(0,240,255,.07);padding:2px 7px}
+.dlg-head .x{margin-left:auto;background:transparent;border:1px solid var(--line2);color:var(--dim);
+  cursor:pointer;font-family:var(--mono);font-size:14px;padding:3px 11px;transition:all .2s}
+.dlg-head .x:hover{border-color:var(--mg);color:var(--mg);box-shadow:0 0 10px rgba(255,42,109,.5)}
+.sp-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;padding:16px}
+@media(max-width:760px){.sp-grid{grid-template-columns:1fr}}
+.sp-card{background:var(--panel2);border:1px solid var(--line);padding:12px;
+  clip-path:polygon(10px 0,100% 0,100% calc(100% - 10px),calc(100% - 10px) 100%,0 100%,0 10px)}
+.sp-card h4{font-family:var(--head);font-size:12px;letter-spacing:2px;color:var(--yl);margin-bottom:8px}
+.sp-card h4 small{font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:1px;margin-left:8px}
+.sp-card svg{width:100%;max-width:340px;display:block;margin:0 auto;background:var(--bg);border:1px solid var(--line)}
+.sp-card .sc-dot{fill:var(--acc);opacity:.75}
+.sp-card .sc-dot.now{fill:var(--yl);opacity:1;filter:drop-shadow(0 0 4px rgba(252,238,10,.9))}
+.sp-card .sc-mean{stroke:var(--gn);stroke-width:1.6;stroke-linecap:round}
+.sp-card .sc-rms{fill:none;stroke:var(--gn);stroke-width:1.2;stroke-dasharray:4 3;opacity:.8}
+.sp-card .sc-axis{stroke:var(--faint);stroke-width:1}
+.sp-card .sc-frame{fill:none;stroke:rgba(0,240,255,.35);stroke-width:1;stroke-dasharray:3 3}
+.sp-card .sc-t{font-family:var(--mono);fill:var(--dim);font-size:9px}
+.sp-stat{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-family:var(--mono);font-size:11px;color:var(--dim)}
+.sp-stat b{color:var(--cy)}
+.sp-empty{text-align:center;padding:40px;font-family:var(--mono);color:var(--dim);font-size:12px;letter-spacing:1px}
+
+/* 历轮精度曲线 */
+.tc-wrap{margin:16px 16px 0;padding:14px;background:var(--panel2);border:1px solid var(--line);
+  clip-path:polygon(10px 0,100% 0,100% calc(100% - 10px),calc(100% - 10px) 100%,0 100%,0 10px)}
+.tc-sub{font-family:var(--head);font-size:12px;letter-spacing:2px;color:var(--yl);margin-bottom:10px}
+.tc-empty{margin:16px;padding:18px;text-align:center;font-family:var(--mono);font-size:11px;
+  letter-spacing:1px;color:var(--dim);border:1px dashed var(--line2);background:rgba(0,240,255,.03)}
+.tc-svg{width:100%;height:auto;display:block;background:var(--bg);border:1px solid var(--line)}
+.tc-grid{stroke:var(--faint);stroke-width:1}
+.tc-lb{font-family:var(--mono);font-size:9px;fill:var(--dim)}
+.tc-line-rms{fill:none;stroke:var(--cy);stroke-width:2;filter:drop-shadow(0 0 4px rgba(0,240,255,.7))}
+.tc-area-rms{fill:rgba(0,240,255,.08);stroke:none}
+.tc-line-bias{fill:none;stroke:var(--mg);stroke-width:2;stroke-dasharray:6 3;filter:drop-shadow(0 0 4px rgba(255,42,109,.6))}
+circle.tc-rms{fill:var(--cy)}
+circle.tc-bias{fill:var(--mg)}
+.per-line{fill:none;stroke-width:1.6;opacity:.85}
+.tc-legend{display:flex;gap:18px;flex-wrap:wrap;margin-top:10px;font-family:var(--mono);font-size:11px;color:var(--dim)}
+.tc-legend span{display:flex;align-items:center;gap:6px}
+.tc-legend .sw{width:14px;height:3px;display:inline-block;border-radius:2px}
+.tc-legend .sw.rms{background:var(--cy);box-shadow:0 0 6px var(--cy)}
+.tc-legend .sw.bias{background:var(--mg);box-shadow:0 0 6px var(--mg)}
+.tc-delta{margin-left:auto}
+.tc-delta b.good{color:var(--gn)}
+.tc-delta b.bad{color:var(--mg)}
+.tc-foot{margin-top:10px;text-align:right}
+
+/* 各兵种专属迷你曲线卡片 */
+.tcm-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+@media(max-width:860px){.tcm-grid{grid-template-columns:1fr}}
+.tcm-card{background:var(--bg);border:1px solid var(--line);padding:10px;cursor:pointer;
+  transition:all .2s;position:relative}
+.tcm-card:hover{border-color:var(--uc);box-shadow:0 0 14px -4px var(--uc)}
+.tcm-card.cur{border-color:var(--uc);box-shadow:0 0 16px -4px var(--uc), inset 0 0 20px -14px var(--uc)}
+.tcm-head{display:flex;align-items:center;gap:7px;font-family:var(--head);font-size:12px;
+  letter-spacing:2px;color:var(--uc);margin-bottom:8px}
+.tcm-head i{width:10px;height:10px;background:var(--uc);box-shadow:0 0 8px var(--uc);
+  clip-path:polygon(50% 0,100% 50%,50% 100%,0 50%)}
+.tcm-head small{margin-left:auto;font-family:var(--mono);font-size:9px;color:var(--dim);letter-spacing:1px}
+.tcm-svg{border:1px solid var(--line)}
+.tcm-empty{height:96px;display:flex;align-items:center;justify-content:center;
+  font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:1px;
+  border:1px dashed var(--line2)}
+.tcm-foot{margin-top:7px;font-family:var(--mono);font-size:9.5px;color:var(--dim);letter-spacing:.5px}
+</style>
+</head>
+<body class="" data-unit="infantry">
+
+<header>
+  <div class="logo">
+    <div class="hex">RM</div>
+    <div>
+      <h1 class="glitch" data-text="靶车控制台">靶车<b>控制台</b></h1>
+      <small>TARGET VEHICLE CONSOLE · NIGHT CITY v2.077</small>
+    </div>
+  </div>
+  <div class="spacer"></div>
+  <div class="unit-switch" id="unitSwitch" title="被测机器人兵种：测试数据按兵种分开记录">
+    <button data-unit="infantry" class="on">步 兵<small>INFANTRY</small></button>
+    <button data-unit="sentry">哨 兵<small>SENTRY</small></button>
+    <button data-unit="heavy">重 装<small>HEAVY</small></button>
+  </div>
+  <div class="team-switch" id="teamSwitch">
+    <button data-team="red" class="on">红 方</button>
+    <button data-team="blue">蓝 方</button>
+  </div>
+  <div class="conn">
+    <span class="dot" id="wsDot"></span>
+    <input id="wsUrl" value="ws://192.168.1.100:8080" spellcheck="false" title="泰山派 WebSocket 地址">
+    <button class="btn acc" id="wsBtn">连 接</button>
+    <button class="btn" id="demoBtn">演示模式</button>
+  </div>
+</header>
+
+<main>
+  <!-- ══ 左：装甲板 ══ -->
+  <section class="panel">
+    <div class="p-head">装甲板监测 <span class="tag">HIT DETECT</span>
+      <span class="unit-tag">被测兵种 <b id="unitTag">步兵</b></span>
+      <div style="margin-left:auto;display:flex;gap:8px">
+        <button class="btn" id="endRound" style="font-size:12px">结束本轮</button>
+        <button class="btn" id="spreadBtn" style="font-size:12px">散布分析</button>
+        <button class="btn" id="resetAll" style="font-size:12px">全部清零</button>
+      </div>
+    </div>
+    <div class="p-body"><div class="armors" id="armors"></div></div>
+  </section>
+
+  <!-- ══ 右：控制 ══ -->
+  <div class="right">
+    <!-- 实时俯视模型 -->
+    <section class="panel">
+      <div class="p-head">实时模型 <span class="tag">MODEL</span>
+        <span style="margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--dim)">
+          航向 <b id="modelAng" style="color:var(--acc)">0°</b>
+          · 轨道 <b id="modelRail" style="color:var(--acc)">50%</b>
+        </span>
+        <div class="vtabs">
+          <button class="vt on" data-v="top">俯视</button><button class="vt" data-v="iso">斜视</button>
+        </div>
+      </div>
+      <div class="p-body">
+        <svg class="model" id="viewTop" viewBox="0 0 340 170">
+          <defs>
+            <!-- 迷你装甲板：与上方监测板同款（八边形+双侧灯条+兵种专属编号/图案+斜线翼+箭头） -->
+            <g id="armorMini">
+              <polygon style="fill:rgba(20,20,40,.55);stroke:var(--cy);stroke-width:1" points="-7.9,-11 7.9,-11 11,-7.2 11,7.2 7.9,11 -7.9,11 -11,7.2 -11,-7.2"/>
+              <polygon style="fill:none;stroke:rgba(0,240,255,.35);stroke-width:.6;stroke-dasharray:2 1.6" points="-7.5,-10.2 7.5,-10.2 10.3,-6.7 10.3,6.7 7.5,10.2 -7.5,10.2 -10.3,6.7 -10.3,-6.7"/>
+              <rect style="fill:var(--acc);filter:drop-shadow(0 0 3px var(--acc-glow))" x="-10.4" y="-6.2" width="1.4" height="12.4" rx="0.6"/>
+              <rect style="fill:#fff;opacity:.85" x="-9.9" y="-5.6" width="0.4" height="11.2"/>
+              <rect style="fill:var(--acc);filter:drop-shadow(0 0 3px var(--acc-glow))" x="9" y="-6.2" width="1.4" height="12.4" rx="0.6"/>
+              <rect style="fill:#fff;opacity:.85" x="9.5" y="-5.6" width="0.4" height="11.2"/>
+              <polygon style="display:var(--emD);fill:none;stroke:var(--yl);stroke-width:1.2;opacity:.6;stroke-linejoin:round" points="0,-4.3 3.2,0 0,4.3 -3.2,0"/>
+              <polygon style="display:var(--emD);fill:none;stroke:rgba(0,240,255,.5);stroke-width:.7" points="0,-2.7 1.8,0 0,2.7 -1.8,0"/>
+              <!-- 哨兵官方剪影（迷你版） -->
+              <g style="display:var(--emS);fill:none;stroke:#fff;stroke-linejoin:round">
+                <path style="stroke-width:.8" d="M-3.6,-3.2 L-1.6,-5.4 L2.2,-6 L3,-4.6 L4.8,-5 L4.6,-3.2 L6.2,-2.8 L6,-1 L3.2,-0.8 L1.8,1.6 L-1.8,2 L-3.8,-0.2 Z"/>
+                <path style="stroke-width:1" d="M-2.2,3 L2.2,3 L3.4,5.6 L-3.4,5.6 Z"/>
+                <rect style="fill:#fff;stroke:none" x="-1" y="1.9" width="2" height="0.9"/>
+              </g>
+              <text style="display:var(--mk3);fill:var(--yl);font-family:var(--head);font-weight:700;font-size:8px;text-anchor:middle" y="3">3</text>
+              <text style="display:var(--mk1);fill:var(--yl);font-family:var(--head);font-weight:700;font-size:8px;text-anchor:middle" y="3">1</text>
+              <path style="fill:none;stroke:rgba(0,240,255,.5);stroke-width:.7" d="M3.2,0 L8.4,8.4 M-3.2,0 L-8.4,8.4 M2.4,0.8 L6.3,7 M-2.4,0.8 L-6.3,7"/>
+              <path style="fill:none;stroke:var(--yl);stroke-width:1.2;opacity:.6" d="M-2.1,-7.2 L0,-8.9 L2.1,-7.2 M-2.1,8.8 L0,10.4 L2.1,8.8"/>
+            </g>
+          </defs>
+          <!-- 限轨 -->
+          <line class="track" x1="36" y1="88" x2="304" y2="88"/>
+          <line class="stop" x1="32" y1="76" x2="32" y2="100"/>
+          <line class="stop" x1="308" y1="76" x2="308" y2="100"/>
+          <!-- 靶车（随移动/旋转实时变化） -->
+          <g id="veh">
+            <circle class="wheel" cx="-20" cy="-19" r="4"/>
+            <circle class="wheel" cx="20" cy="-19" r="4"/>
+            <circle class="wheel" cx="-20" cy="19" r="4"/>
+            <circle class="wheel" cx="20" cy="19" r="4"/>
+            <polygon class="chassis" points="-22,-16 22,-16 30,-9 30,9 22,16 -22,16 -30,9 -30,-9"/>
+            <line class="spinmark" x1="0" y1="0" x2="0" y2="-12"/>
+            <circle class="hub" r="9"/>
+            <g class="mp" data-slot="0" transform="translate(0,-45)"><use href="#armorMini"/><circle class="mhit" r="2.4"/></g>
+            <g class="mp" data-slot="1" transform="translate(45,0) rotate(90)"><use href="#armorMini"/><circle class="mhit" r="2.4"/></g>
+            <g class="mp" data-slot="2" transform="translate(0,45) rotate(180)"><use href="#armorMini"/><circle class="mhit" r="2.4"/></g>
+            <g class="mp" data-slot="3" transform="translate(-45,0) rotate(-90)"><use href="#armorMini"/><circle class="mhit" r="2.4"/></g>
+          </g>
+        </svg>
+
+        <!-- 斜视 3D（CSS 透视，随航向/轨道实时联动） -->
+        <div class="scene3d" id="viewIso" style="display:none">
+          <div class="tilt">
+            <div class="rail3d"></div>
+            <div class="stop3d l"></div><div class="stop3d r"></div>
+            <div class="body3d" id="body3d">
+              <div class="wall3d wf"></div><div class="wall3d wb"></div>
+              <div class="wall3d wl"></div><div class="wall3d wr"></div>
+              <div class="ctop3d"></div>
+              <div class="wheel3d a"></div><div class="wheel3d b"></div>
+              <div class="wheel3d c"></div><div class="wheel3d d"></div>
+              <div class="spin3d" id="spin3d">
+                <div class="plate3d pf" data-slot="0"><i></i><i></i><svg class="s3d" viewBox="0 0 60 70"><path d="M6,26 L16,14 L34,11 L38,16 L46,14 L45,22 L56,24 L55,32 L42,33 L36,42 L18,44 L8,34 Z"/><rect x="25" y="42" width="10" height="5"/><path d="M17,50 L43,50 L51,64 L9,64 Z"/></svg><span class="uwave3"></span><span class="phit"></span></div>
+                <div class="plate3d pr" data-slot="1"><i></i><i></i><svg class="s3d" viewBox="0 0 60 70"><path d="M6,26 L16,14 L34,11 L38,16 L46,14 L45,22 L56,24 L55,32 L42,33 L36,42 L18,44 L8,34 Z"/><rect x="25" y="42" width="10" height="5"/><path d="M17,50 L43,50 L51,64 L9,64 Z"/></svg><span class="uwave3"></span><span class="phit"></span></div>
+                <div class="plate3d pb" data-slot="2"><i></i><i></i><svg class="s3d" viewBox="0 0 60 70"><path d="M6,26 L16,14 L34,11 L38,16 L46,14 L45,22 L56,24 L55,32 L42,33 L36,42 L18,44 L8,34 Z"/><rect x="25" y="42" width="10" height="5"/><path d="M17,50 L43,50 L51,64 L9,64 Z"/></svg><span class="uwave3"></span><span class="phit"></span></div>
+                <div class="plate3d pl" data-slot="3"><i></i><i></i><svg class="s3d" viewBox="0 0 60 70"><path d="M6,26 L16,14 L34,11 L38,16 L46,14 L45,22 L56,24 L55,32 L42,33 L36,42 L18,44 L8,34 Z"/><rect x="25" y="42" width="10" height="5"/><path d="M17,50 L43,50 L51,64 L9,64 Z"/></svg><span class="uwave3"></span><span class="phit"></span></div>
+              </div>
+              <div class="hub3d"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 靶车移动 -->
+    <section class="panel">
+      <div class="p-head">靶车移动 <span class="tag">RAIL</span></div>
+      <div class="p-body">
+        <div class="rail-vis" id="railVis"><div class="track"></div><div class="car" id="railCar"></div></div>
+        <div class="ctl-row">
+          <span class="ctl-lb">方 向</span>
+          <div class="dir-btns" style="flex:1" id="moveBtns">
+            <button data-dir="back">◀ 后退</button>
+            <button data-dir="stop" class="on">停 止</button>
+            <button data-dir="fwd">前进 ▶</button>
+          </div>
+        </div>
+        <div class="slider-row">
+          <span class="ctl-lb">速 度</span>
+          <input type="range" id="moveSpd" min="0" max="100" value="50">
+          <span class="val" id="moveSpdV">50%</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 旋转 -->
+    <section class="panel">
+      <div class="p-head">旋转控制 <span class="tag">SPIN</span></div>
+      <div class="p-body">
+        <div class="rot-vis">
+          <div class="rot-disc" id="rotDisc"><div class="blade" id="rotBlade"></div></div>
+          <div class="rot-info">
+            状态 <b id="rotSt">停止</b><br>
+            方向 <b id="rotDirV">顺时针</b><br>
+            转速 <b id="rotRpm">--</b>
+          </div>
+          <label class="switch" style="margin-left:auto">
+            <input type="checkbox" id="rotOn"><span class="tr"></span>
+          </label>
+        </div>
+        <div class="ctl-row">
+          <span class="ctl-lb">方 向</span>
+          <div class="dir-btns" id="rotDirBtns">
+            <button data-dir="cw" class="on">顺时针 ⟳</button>
+            <button data-dir="ccw">逆时针 ⟲</button>
+          </div>
+        </div>
+        <div class="slider-row">
+          <span class="ctl-lb">转 速</span>
+          <input type="range" id="rotSpd" min="0" max="100" value="40">
+          <span class="val" id="rotSpdV">40%</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 日志 -->
+    <section class="panel">
+      <div class="p-head">事件日志 <span class="tag">LOG</span></div>
+      <div class="log" id="log"></div>
+    </section>
+  </div>
+</main>
+
+<!-- ══ 散布分析弹窗 ══ -->
+<div class="mask" id="spreadMask">
+  <div class="dlg">
+    <div class="dlg-head">弹丸散布分析 <span class="tag">SPREAD REPORT</span>
+      <span style="font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:1px" id="spTime"></span>
+      <button class="x" id="spClose">✕</button>
+    </div>
+    <div id="spBody"></div>
+  </div>
+</div>
+
+<footer>HX711×4 → STM32 ×4 → <b>泰山派 RK3566</b> · WebSocket JSON 协议 · 命中解算：四角压敏加权质心 · <b>STAY NEON, KEEP SHOOTING</b></footer>
+
+<script>
+"use strict";
+/* ═══════════ 配置 ═══════════ */
+// 传感器物理位置（装甲板归一化坐标0~100），CH1左上 CH2右上 CH3右下 CH4左下
+// 安装于官方小装甲板四条切角边中点附近
+const SENSOR_POS = [{x:8.3,y:10},{x:91.7,y:10},{x:91.7,y:90},{x:8.3,y:90}];
+const CH_LABEL   = ["CH1左上","CH2右上","CH3右下","CH4左下"];
+// 归一化坐标(0~100) → SVG像素（装甲板命中区 x:16~184, y:16~154）
+const P2X = x => 16 + x*1.68;
+const P2Y = y => 16 + y*1.38;
+// 触发判定：四通道去趋势绝对值之和超过此阈值视为一次有效击打
+const HIT_THRESHOLD = 800;
+const MAX_MARKERS = 20;   // 最近命中闪烁环数量
+const MAX_SCATTER = 300;  // 散布分析保留的落点数（测试后弹窗查看）
+const HIT_DEBOUNCE = 70;  // 命中去抖(ms)：支持高速连击
+
+/* ═══════════ 状态 ═══════════ */
+const state = {
+  team: "red",
+  unit: "infantry",              // 被测机器人兵种：infantry/sentry/heavy
+  armors: [0,1,2,3].map(i => ({
+    slot: i, id: i + 1,          // slot=物理序号, id=用户设定的ID
+    hits: 0, ch: [0,0,0,0],      // 去趋势后权重
+    lastHit: null, markers: [],  // markers:[{x,y,t}] 最近命中闪烁
+    scatter: []                  // scatter:[{x,y}] 弹丸散布持久落点
+  })),
+  move: {dir:"stop", speed:50},
+  rotate: {on:false, dir:"cw", speed:40},
+  ws: null, wsOk: false,
+  demo: false, demoTimer: null,
+  baseline: [0,1,2,3].map(()=>[0,0,0,0]),
+};
+
+/* ═══════════ 工具 ═══════════ */
+const $ = s => document.querySelector(s);
+function log(msg, cls="dm"){
+  const el = $("#log");
+  const t = new Date().toTimeString().slice(0,8);
+  el.insertAdjacentHTML("afterbegin",
+    `<div><span class="t">[${t}]</span> <span class="${cls}">${msg}</span></div>`);
+  while(el.children.length > 80) el.lastChild.remove();
+}
+function now(){ return performance.now(); }
+
+/* ═══════════ 装甲板 DOM 构建 ═══════════ */
+function buildArmors(){
+  const box = $("#armors");
+  state.armors.forEach(a => {
+    const el = document.createElement("div");
+    el.className = "armor"; el.id = "armor" + a.slot;
+    el.innerHTML = `
+      <div class="a-top">
+        <span class="slot">槽位<b>${a.slot}</b></span>
+        <span style="color:var(--dim);font-size:12px">ID</span>
+        <input type="number" min="0" max="255" value="${a.id}" data-slot="${a.slot}" class="id-in" title="装甲板ID">
+        <div class="cnt"><i>HITS</i><b class="cnt-v">0</b></div>
+        <button class="rst" data-slot="${a.slot}">清零</button>
+      </div>
+      <div class="plate-wrap">
+        <svg class="plate" viewBox="0 0 200 170">
+          <polygon class="shell" points="40,16 160,16 184,40 184,130 160,154 40,154 16,130 16,40"/>
+          <polygon class="inner" points="43,21 157,21 179,43 179,127 157,149 43,149 21,127 21,43"/>
+          <!-- 左右竖直灯条（随红蓝阵营变色发光） -->
+          <rect class="lbar" x="22" y="46" width="7" height="78" rx="3"/>
+          <rect class="lbar-core" x="24.5" y="50" width="2" height="70" rx="1"/>
+          <rect class="lb-streak" x="22" y="46" width="7" height="16" rx="3"/>
+          <rect class="lbar" x="171" y="46" width="7" height="78" rx="3"/>
+          <rect class="lbar-core" x="173.5" y="50" width="2" height="70" rx="1"/>
+          <rect class="lb-streak rv" x="171" y="46" width="7" height="16" rx="3"/>
+          <!-- 装甲板印刷纹样：兵种专属徽标 + 斜线翼 + 上下箭头 -->
+          <polygon class="pat emblem em-d" points="100,58 124,85 100,112 76,85"/>
+          <polygon class="pat2 emblem em-d" points="100,68 114,85 100,102 86,85"/>
+          <!-- 哨兵官方贴纸：机器人剪影（2026规范手册 附录图5） -->
+          <g class="em-sentry">
+            <path class="es-head" d="M74,67 L84,56 L103,53 L107,58 L114,56 L113,64 L129,67 L128,77 L110,78 L103,89 L85,91 L75,79 Z"/>
+            <rect class="es-neck" x="94" y="90" width="13" height="5"/>
+            <path class="es-base" d="M85,100 L116,100 L125,116 L76,116 Z"/>
+          </g>
+          <text class="unit-mark m3" x="100" y="85" dominant-baseline="central">3</text>
+          <text class="unit-mark m1" x="100" y="85" dominant-baseline="central">1</text>
+          <path class="pat2" d="M124,85 L164,138 M76,85 L36,138 M118,90 L148,129 M82,90 L52,129"/>
+          <path class="pat" d="M84,40 L100,29 L116,40"/>
+          <path class="pat" d="M84,140 L100,150 L116,140"/>
+          <!-- 四角压敏传感器 -->
+          ${SENSOR_POS.map((p,i)=>`<circle class="sen" data-sen="${i}" cx="${P2X(p.x)}" cy="${P2Y(p.y)}" r="4"/>`).join("")}
+          <g class="marks"></g>
+          <g class="latest" style="display:none">
+            <path class="hit-x" d="M-6-6L6 6M-6 6L6-6" style="transform-box:fill-box"/>
+            <circle class="hit-ring" r="12"/>
+            <text class="latest-lb" x="12" y="-10"></text>
+          </g>
+          <!-- 兵种切换特效：飞镖命中冲击波（双环） -->
+          <circle class="uf-ring" cx="100" cy="85" r="34"/>
+          <circle class="uf-ring r2" cx="100" cy="85" r="34"/>
+        </svg>
+        <div class="uwave"><i></i><i></i></div>
+        <div class="twash"></div>
+      </div>
+      <div class="ch-bars">${CH_LABEL.map((lb,i)=>`
+        <div class="chb"><span class="lb">${lb}</span>
+        <div class="bar"><i data-ch="${i}"></i></div></div>`).join("")}
+      </div>
+      <div class="a-foot">
+        <span class="pos">落点 <b class="pos-v">--</b></span>
+        <span class="spread">散布RMS <b class="spread-v">--</b></span>
+        <span class="age"></span>
+      </div>`;
+    box.appendChild(el);
+    a.dom = el;
+  });
+
+  // ID 修改
+  box.querySelectorAll(".id-in").forEach(inp => {
+    inp.addEventListener("change", () => {
+      const slot = +inp.dataset.slot;
+      const id = Math.max(0, Math.min(255, +inp.value || 0));
+      inp.value = id;
+      state.armors[slot].id = id;
+      send({cmd:"set_id", slot, id});
+      log(`槽位${slot} 装甲板ID → ${id}`);
+    });
+  });
+  // 单板清零
+  box.querySelectorAll(".rst").forEach(btn => btn.addEventListener("click",
+    () => resetHits(+btn.dataset.slot)));
+}
+
+/* ═══════════ 命中解算：四角加权质心 ═══════════ */
+function solveHit(ch){
+  // 通道值取绝对参与（压敏为压力增量，允许负原始值），最小值截断抑制噪声
+  const w = ch.map(v => Math.max(0, Math.abs(v)));
+  const sum = w[0]+w[1]+w[2]+w[3];
+  if(sum < 1e-6) return null;
+  let x=0, y=0;
+  w.forEach((wi,i)=>{ x += wi*SENSOR_POS[i].x; y += wi*SENSOR_POS[i].y; });
+  return {x:+(x/sum).toFixed(1), y:+(y/sum).toFixed(1), sum};
+}
+
+function onHit(slot, pos){
+  const a = state.armors[slot];
+  if(!a) return;
+  a.hits++;
+  a.lastHit = pos;
+  a.markers.push({x:pos.x, y:pos.y, t:now()});
+  if(a.markers.length > MAX_MARKERS) a.markers.shift();
+  a.scatter.push({x:pos.x, y:pos.y});
+  if(a.scatter.length > MAX_SCATTER) a.scatter.shift();
+  renderScatter(a);
+  a.dom.classList.add("recent");
+  setTimeout(()=>a.dom.classList.remove("recent"), 400);
+  renderArmor(a, true);
+  syncModelHit(slot, pos);
+  log(`◈ 命中 装甲板${a.id} (槽位${slot}) @ (${pos.x}, ${pos.y}) 第${a.hits}次`, "in");
+}
+
+/* ═══════════ 弹丸散布统计（板面不叠加，测试后经弹窗查看） ═══════════ */
+function spreadStats(a){
+  const n = a.scatter.length;
+  if(!n) return null;
+  const mx = a.scatter.reduce((s,p)=>s+p.x,0)/n;
+  const my = a.scatter.reduce((s,p)=>s+p.y,0)/n;
+  const dx = Math.sqrt(a.scatter.reduce((s,p)=>s+(p.x-mx)**2,0)/n);
+  const dy = Math.sqrt(a.scatter.reduce((s,p)=>s+(p.y-my)**2,0)/n);
+  return {n, mx, my, dx, dy};
+}
+function renderScatter(a){
+  const st = spreadStats(a);
+  a.dom.querySelector(".spread-v").textContent =
+    st ? `X±${st.dx.toFixed(1)} Y±${st.dy.toFixed(1)}` : "--";
+}
+
+/* ═══════════ 测试轮次历史（按兵种分开记录，用于历轮精度曲线） ═══════════ */
+const ROUNDS_KEY = "zjb_test_rounds_v2";
+const UNITS = {infantry:"步兵", sentry:"哨兵", heavy:"重装"};
+function loadAll(){
+  try {
+    const o = JSON.parse(localStorage.getItem(ROUNDS_KEY));
+    if(o && typeof o === "object" && !Array.isArray(o)) return o;
+    // 迁移旧版（未区分兵种）数据 → 归入步兵
+    const legacy = JSON.parse(localStorage.getItem("zjb_test_rounds"));
+    if(Array.isArray(legacy) && legacy.length) return {infantry: legacy};
+  } catch(e) {}
+  return {};
+}
+function saveAll(o){
+  try {
+    const cut = {};
+    for(const k in o) cut[k] = (o[k] || []).slice(-60);
+    localStorage.setItem(ROUNDS_KEY, JSON.stringify(cut));
+  }
+  catch(e) { /* 隐私模式下忽略 */ }
+}
+const allRounds = loadAll();
+function roundsFor(u){ return allRounds[u] || (allRounds[u] = []); }
+const curRounds = () => roundsFor(state.unit);
+
+// 单板统计 → 精度指标：rms=散布半径（精密度），bias=均值偏离板心(50,50)（准确度）
+function armorMetrics(a){
+  const st = spreadStats(a);
+  if(!st) return null;
+  return {
+    n: st.n,
+    rms: Math.sqrt(st.dx*st.dx + st.dy*st.dy),
+    bias: Math.hypot(st.mx - 50, st.my - 50),
+    dx: st.dx, dy: st.dy, mx: st.mx, my: st.my
+  };
+}
+function endRound(){
+  const ms = state.armors.map(armorMetrics);
+  const valid = ms.filter(Boolean);
+  if(!valid.length){ log("本轮无命中数据，未记录", "er"); return; }
+  const total = valid.reduce((s,m)=>s+m.n,0);
+  const w = (key) => valid.reduce((s,m)=>s+m[key]*m.n,0)/total;
+  const rec = {
+    t: Date.now(),
+    n: total,
+    rms: w("rms"),                       // 加权平均散布RMS
+    bias: w("bias"),                     // 加权平均中心偏差
+    per: ms.map(m => m ? {n:m.n, rms:+m.rms.toFixed(2), bias:+m.bias.toFixed(2)} : null),
+    ids: state.armors.map(a => a.id)
+  };
+  const rounds = curRounds();
+  rounds.push(rec);
+  saveAll(allRounds);
+  log(`◈ [${UNITS[state.unit]}] 第 ${rounds.length} 轮已记录：${total} 发 · 散布RMS ${rec.rms.toFixed(1)} · 偏差 ${rec.bias.toFixed(1)}`, "in");
+  openSpread();
+}
+$("#endRound").addEventListener("click", endRound);
+
+/* 历轮曲线图：X=轮次，Y=数值，两条主线（散布RMS / 中心偏差） */
+function trendChart(rounds){
+  const W = 640, H = 240, L = 44, R = 16, T = 18, B = 34;
+  const iw = W - L - R, ih = H - T - B;
+  const n = rounds.length;
+  const maxV = Math.max(...rounds.map(r=>Math.max(r.rms, r.bias)), 10) * 1.15;
+  const X = i => n === 1 ? L + iw/2 : L + iw * i/(n-1);
+  const Y = v => T + ih * (1 - v/maxV);
+  const path = key => rounds.map((r,i)=>`${i?"L":"M"}${X(i).toFixed(1)} ${Y(r[key]).toFixed(1)}`).join(" ");
+  const area = key => path(key) +
+    `L${X(n-1).toFixed(1)} ${T+ih} L${X(0).toFixed(1)} ${T+ih}Z`;
+  const dots = key => rounds.map((r,i)=>
+    `<circle cx="${X(i).toFixed(1)}" cy="${Y(r[key]).toFixed(1)}" r="3" class="tc-${key}"/>`).join("");
+  const grid = [0,.25,.5,.75,1].map(f=>{
+    const v = maxV*f, y = Y(v);
+    return `<line class="tc-grid" x1="${L}" y1="${y.toFixed(1)}" x2="${W-R}" y2="${y.toFixed(1)}"/>
+      <text class="tc-lb" x="${L-6}" y="${(y+3).toFixed(1)}" text-anchor="end">${v.toFixed(0)}</text>`;
+  }).join("");
+  const xlb = rounds.map((r,i)=>{
+    if(n > 12 && i % Math.ceil(n/12)) return "";
+    return `<text class="tc-lb" x="${X(i).toFixed(1)}" y="${H-14}" text-anchor="middle">${i+1}</text>`;
+  }).join("");
+  const first = rounds[0], last = rounds[n-1];
+  const delta = n > 1 ? `较首轮 散布 <b class="${last.rms<first.rms?"good":"bad"}">${((last.rms-first.rms)/first.rms*100).toFixed(0)}%</b>
+      · 偏差 <b class="${last.bias<first.bias?"good":"bad"}">${((last.bias-first.bias)/first.bias*100).toFixed(0)}%</b>` : "";
+  return `<svg viewBox="0 0 ${W} ${H}" class="tc-svg">
+    ${grid}
+    <path class="tc-area-rms" d="${area("rms")}"/>
+    <path class="tc-line-rms" d="${path("rms")}"/>
+    <path class="tc-line-bias" d="${path("bias")}"/>
+    ${dots("rms")}${dots("bias")}
+    ${xlb}
+    <text class="tc-lb" x="${L+iw/2}" y="${H-2}" text-anchor="middle">测试轮次</text>
+    <text class="tc-lb" x="12" y="${T+ih/2}" text-anchor="middle" transform="rotate(-90 12 ${T+ih/2})">RMS / 偏差</text>
+  </svg>
+  <div class="tc-legend">
+    <span><i class="sw rms"></i>散布 RMS（越小越稳）</span>
+    <span><i class="sw bias"></i>中心偏差（越小越准）</span>
+    <span class="tc-delta">${delta}</span>
+  </div>`;
+}
+
+/* 各板历轮 RMS 细线（辅助定位是哪块板在改善） */
+function perBoardChart(rounds){
+  if(rounds.length < 2) return "";
+  const ids = rounds[rounds.length-1].ids || ["1","2","3","4"];
+  const cols = ["var(--cy)","var(--mg)","var(--yl)","var(--gn)"];
+  const W = 640, H = 180, L = 44, R = 16, T = 14, B = 30;
+  const iw = W-L-R, ih = H-T-B, n = rounds.length;
+  const all = rounds.flatMap(r=>r.per.filter(Boolean).map(p=>p.rms));
+  const maxV = Math.max(...all, 5) * 1.15;
+  const X = i => n===1 ? L+iw/2 : L + iw*i/(n-1);
+  const Y = v => T + ih*(1 - v/maxV);
+  const lines = [0,1,2,3].map(k=>{
+    let d = "", seen = false;
+    rounds.forEach((r,i)=>{
+      const p = (r.per||[])[k];
+      if(!p) return;
+      d += `${seen?"L":"M"}${X(i).toFixed(1)} ${Y(p.rms).toFixed(1)} `;
+      seen = true;
+    });
+    if(!seen) return "";
+    return `<path class="per-line" d="${d}" style="stroke:${cols[k]}"/>`;
+  }).join("");
+  const grid = [0,.5,1].map(f=>{
+    const v = maxV*f, y = Y(v);
+    return `<line class="tc-grid" x1="${L}" y1="${y.toFixed(1)}" x2="${W-R}" y2="${y.toFixed(1)}"/>
+      <text class="tc-lb" x="${L-6}" y="${(y+3).toFixed(1)}" text-anchor="end">${v.toFixed(0)}</text>`;
+  }).join("");
+  return `<div class="tc-sub">各装甲板散布 RMS 趋势</div>
+    <svg viewBox="0 0 ${W} ${H}" class="tc-svg">${grid}${lines}</svg>
+    <div class="tc-legend">${ids.map((id,k)=>`<span><i class="sw" style="background:${cols[k]};box-shadow:0 0 6px ${cols[k]}"></i>板 ${id}</span>`).join("")}</div>`;
+}
+
+/* ═══ 兵种专属迷你曲线：每个兵种一张小图，主题色区分，点击卡片切换兵种 ═══ */
+const UNIT_COLORS = {infantry:"#00f0ff", sentry:"#fcee0a", heavy:"#ff2a6d"};
+function unitMiniChart(u){
+  const rounds = allRounds[u] || [];
+  const col = UNIT_COLORS[u];
+  const n = rounds.length;
+  let svg;
+  if(!n){
+    svg = `<div class="tcm-empty">暂无测试轮次</div>`;
+  } else {
+    const W = 320, H = 150, L = 34, R = 10, T = 12, B = 24;
+    const iw = W-L-R, ih = H-T-B;
+    const maxV = Math.max(...rounds.map(r=>Math.max(r.rms, r.bias)), 10) * 1.15;
+    const X = i => n===1 ? L+iw/2 : L + iw*i/(n-1);
+    const Y = v => T + ih*(1 - v/maxV);
+    const path = key => rounds.map((r,i)=>`${i?"L":"M"}${X(i).toFixed(1)} ${Y(r[key]).toFixed(1)}`).join(" ");
+    const grid = [0,1].map(f=>{
+      const y = Y(maxV*f);
+      return `<line class="tc-grid" x1="${L}" y1="${y.toFixed(1)}" x2="${W-R}" y2="${y.toFixed(1)}"/>
+        <text class="tc-lb" x="${L-5}" y="${(y+3).toFixed(1)}" text-anchor="end">${(maxV*f).toFixed(0)}</text>`;
+    }).join("");
+    const xlb = n > 1 ? `<text class="tc-lb" x="${X(n-1).toFixed(1)}" y="${H-8}" text-anchor="middle">第${n}轮</text>` : "";
+    svg = `<svg viewBox="0 0 ${W} ${H}" class="tc-svg tcm-svg">
+      ${grid}
+      <path d="${path("rms")}" fill="none" stroke="${col}" stroke-width="2" style="filter:drop-shadow(0 0 3px ${col})"/>
+      <path d="${path("bias")}" fill="none" stroke="${col}" stroke-width="1.4" stroke-dasharray="5 3" opacity=".65"/>
+      ${rounds.map((r,i)=>`<circle cx="${X(i).toFixed(1)}" cy="${Y(r.rms).toFixed(1)}" r="2.4" fill="${col}"/>`).join("")}
+      ${xlb}
+    </svg>`;
+  }
+  const last = rounds[n-1];
+  const info = last ? `最近 ${last.rms.toFixed(1)} / 偏差 ${last.bias.toFixed(1)} · ${last.n}发` : "—";
+  return `<div class="tcm-card${state.unit===u?" cur":""}" data-unit="${u}" style="--uc:${col}">
+    <div class="tcm-head"><i></i>${UNITS[u]}<small>${n} 轮</small></div>
+    ${svg}
+    <div class="tcm-foot">${info}</div>
+  </div>`;
+}
+
+/* ═══════════ 散布分析弹窗：测试结束后调出图形与散布 ═══════════ */
+function spreadCard(a){
+  const st = spreadStats(a);
+  const dots = a.scatter.map((p,i)=>
+    `<circle class="sc-dot${i===a.scatter.length-1?" now":""}" cx="${P2X(p.x).toFixed(1)}" cy="${P2Y(p.y).toFixed(1)}" r="2.4"/>`
+  ).join("");
+  let overlay = "";
+  if(st){
+    const cx = P2X(st.mx), cy = P2Y(st.my);
+    overlay = `<ellipse class="sc-rms" cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}"
+        rx="${(st.dx*1.68).toFixed(1)}" ry="${(st.dy*1.38).toFixed(1)}"/>
+      <path class="sc-mean" d="M${(cx-6).toFixed(1)} ${cy.toFixed(1)}H${(cx+6).toFixed(1)}
+        M${cx.toFixed(1)} ${(cy-6).toFixed(1)}V${(cy+6).toFixed(1)}"/>`;
+  }
+  const frame = `<polygon class="sc-frame" points="40,16 160,16 184,40 184,130 160,154 40,154 16,130 16,40"/>`;
+  const stat = st
+    ? `发数 <b>${st.n}</b> · 均值 <b>(${st.mx.toFixed(1)}, ${st.my.toFixed(1)})</b>
+       · RMS <b>X±${st.dx.toFixed(1)} Y±${st.dy.toFixed(1)}</b>
+       · 散布面积 <b>${(Math.PI*st.dx*st.dy).toFixed(0)}</b>`
+    : `无命中数据`;
+  return `<div class="sp-card">
+    <h4>装甲板 ${a.id}<small>槽位 ${a.slot} · 累计 ${a.hits} 发</small></h4>
+    <svg viewBox="0 0 200 170">
+      ${frame}
+      <line class="sc-axis" x1="100" y1="16" x2="100" y2="154"/>
+      <line class="sc-axis" x1="16" y1="85" x2="184" y2="85"/>
+      ${dots}${overlay}
+      <text class="sc-t" x="18" y="14">0,0</text>
+      <text class="sc-t" x="168" y="165">100,100</text>
+    </svg>
+    <div class="sp-stat">${stat}</div>
+  </div>`;
+}
+function openSpread(){
+  const body = $("#spBody");
+  const rounds = curRounds();
+  const uname = UNITS[state.unit];
+  const chart = rounds.length
+    ? `<div class="tc-wrap">
+         <div class="tc-sub">${uname} · 历轮测试精度曲线（共 ${rounds.length} 轮 · 曲线下降 = 设计越来越准）</div>
+         ${trendChart(rounds)}${perBoardChart(rounds)}
+         <div class="tc-foot"><button class="btn" id="clearRounds" style="font-size:11px">清空${uname}轮次历史</button></div>
+       </div>`
+    : `<div class="tc-empty">【${uname}】暂无已结束的测试轮次 · 切换兵种后各自独立记录，每轮测试后点击「结束本轮」即可生成历轮曲线</div>`;
+  const cards = state.armors.every(a=>!a.scatter.length)
+    ? `<div class="sp-empty">本轮尚无命中数据 · 开启演示模式或实弹击打后再查看</div>`
+    : `<div class="sp-grid">${state.armors.map(spreadCard).join("")}</div>`;
+  body.innerHTML = chart + `
+    <div class="tc-wrap">
+      <div class="tc-sub">各兵种专属测试曲线（点击卡片切换兵种查看详情）</div>
+      <div class="tcm-grid">${["infantry","sentry","heavy"].map(unitMiniChart).join("")}</div>
+    </div>` + cards;
+  body.querySelectorAll(".tcm-card").forEach(el=>{
+    el.addEventListener("click", ()=>{
+      const btn = document.querySelector(`#unitSwitch button[data-unit="${el.dataset.unit}"]`);
+      if(btn){ btn.click(); openSpread(); }  // 切换兵种并刷新弹窗详情
+    });
+  });
+  const cr = $("#clearRounds");
+  if(cr) cr.addEventListener("click", ()=>{
+    if(confirm(`确认清空【${uname}】的全部轮次历史？该操作不可恢复。`)){
+      allRounds[state.unit] = []; saveAll(allRounds); openSpread();
+      log(`${uname}轮次历史已清空`, "er");
+    }
+  });
+  $("#spTime").textContent = `${uname} · ` + new Date().toLocaleString("zh-CN", {hour12:false});
+  $("#spreadMask").classList.add("open");
+  document.body.classList.add("sheet-open");
+  log(`调出 ${uname} 弹丸散布分析报告`, "in");
+}
+function closeSpread(){
+  $("#spreadMask").classList.remove("open");
+  document.body.classList.remove("sheet-open");
+}
+$("#spreadBtn").addEventListener("click", openSpread);
+$("#spClose").addEventListener("click", closeSpread);
+$("#spreadMask").addEventListener("click", e=>{ if(e.target === e.currentTarget) closeSpread(); });
+document.addEventListener("keydown", e=>{ if(e.key === "Escape") closeSpread(); });
+
+/* ═══════════ 受击状态同步到俯视/斜视模型 ═══════════ */
+// 槽位→模型板：0=N(pf) 1=E(pr) 2=S(pb) 3=W(pl)，与俯视 use 顺序一致
+const modelTimers = {top:[null,null,null,null], iso:[null,null,null,null]};
+function syncModelHit(slot, pos){
+  // 俯视：命中点定位 + 板体发光
+  const mp = document.querySelector(`.model .mp[data-slot="${slot}"]`);
+  if(mp){
+    const c = mp.querySelector(".mhit");
+    // 板局部坐标：板宽22(x:-11~11)、高22(y:-11~11)，命中x/y为0~100
+    c.setAttribute("cx", (-11 + pos.x*0.22).toFixed(1));
+    c.setAttribute("cy", (-11 + pos.y*0.22).toFixed(1));
+    c.style.display = "";
+    mp.classList.add("hit");
+    clearTimeout(modelTimers.top[slot]);
+    modelTimers.top[slot] = setTimeout(()=>{
+      mp.classList.remove("hit");
+      c.style.display = "none";
+    }, 500);
+  }
+  // 斜视：命中点定位 + 板体闪烁
+  const p3 = document.querySelector(`.plate3d[data-slot="${slot}"]`);
+  if(p3){
+    const d = p3.querySelector(".phit");
+    d.style.left = pos.x + "%";
+    d.style.top = pos.y + "%";
+    d.style.display = "block";
+    p3.classList.add("hit");
+    clearTimeout(modelTimers.iso[slot]);
+    modelTimers.iso[slot] = setTimeout(()=>{
+      p3.classList.remove("hit");
+      d.style.display = "none";
+    }, 500);
+  }
+}
+
+function resetHits(slot){
+  if(slot === "all"){
+    state.armors.forEach(a => { a.hits = 0; a.markers = []; a.scatter = []; a.lastHit = null; renderArmor(a,false); });
+    send({cmd:"reset_hits", slot:"all"});
+    log("全部装甲板击打数清零", "er");
+  } else {
+    const a = state.armors[slot];
+    a.hits = 0; a.markers = []; a.scatter = []; a.lastHit = null; renderArmor(a,false);
+    send({cmd:"reset_hits", slot});
+    log(`装甲板${a.id} (槽位${slot}) 击打数清零`, "er");
+  }
+}
+$("#resetAll").addEventListener("click", () => resetHits("all"));
+
+/* ═══════════ 装甲板渲染 ═══════════ */
+function renderArmor(a, ripple){
+  a.dom.querySelector(".cnt-v").textContent = a.hits;
+  // 传感器活跃度（归一化）
+  const maxV = Math.max(...a.ch.map(Math.abs), 1);
+  a.ch.forEach((v,i)=>{
+    const bar = a.dom.querySelector(`.bar i[data-ch="${i}"]`);
+    bar.style.width = Math.min(100, Math.abs(v)/maxV*100) + "%";
+    bar.classList.toggle("hot", Math.abs(v) > maxV*0.7);
+    a.dom.querySelector(`.sen[data-sen="${i}"]`)
+      .classList.toggle("act", Math.abs(v) > maxV*0.5);
+  });
+  // 历史命中标记
+  const marks = a.dom.querySelector(".marks");
+  const nowT = now();
+  marks.innerHTML = a.markers.map(m=>{
+    const age = (nowT - m.t)/1000;
+    const op = Math.max(0, 1 - age/8);
+    return op > 0.02 ? `<circle class="hit-ring" cx="${P2X(m.x)}" cy="${P2Y(m.y)}" r="3"
+      style="opacity:${op.toFixed(2)}"/>` : "";
+  }).join("");
+  // 最新命中十字
+  const latest = a.dom.querySelector(".latest");
+  if(a.lastHit){
+    latest.style.display = "";
+    const g = latest;
+    g.setAttribute("transform", `translate(${P2X(a.lastHit.x)},${P2Y(a.lastHit.y)})`);
+    g.querySelector(".latest-lb").textContent = `${a.lastHit.x},${a.lastHit.y}`;
+    if(ripple){
+      const old = g.querySelector(".ripple"); if(old) old.remove();
+      const ns = "http://www.w3.org/2000/svg";
+      const c = document.createElementNS(ns,"circle");
+      c.setAttribute("class","ripple"); c.setAttribute("r",12);
+      g.insertBefore(c, g.firstChild);
+      setTimeout(()=>c.remove(), 1000);
+    }
+    a.dom.querySelector(".pos-v").textContent = `X:${a.lastHit.x} Y:${a.lastHit.y}`;
+  } else {
+    latest.style.display = "none";
+    a.dom.querySelector(".pos-v").textContent = "--";
+  }
+}
+
+// 标记淡出循环刷新
+setInterval(()=> state.armors.forEach(a => { if(a.markers.length) renderArmor(a,false); }), 1000);
+
+/* ═══════════ 红蓝切换 ═══════════ */
+$("#teamSwitch").querySelectorAll("button").forEach(btn=>{
+  btn.addEventListener("click", ()=>{
+    $("#teamSwitch").querySelectorAll("button").forEach(b=>b.classList.remove("on"));
+    btn.classList.add("on");
+    state.team = btn.dataset.team;
+    document.body.classList.toggle("blue", state.team === "blue");
+    teamSwitchFx();
+    send({cmd:"team", value: state.team});
+    log(`阵营切换 → ${state.team === "red" ? "红方" : "蓝方"}`, "in");
+  });
+});
+
+/* ═══════════ 兵种切换（测试数据按兵种独立记录） ═══════════ */
+// 切换特效：扫光横扫 + 冲击波双环 + 纹样重铸（参考超抗飞镖命中末端移动靶）
+function fxReflow(selector, cls, dur){
+  document.querySelectorAll(selector).forEach(el=>{
+    el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls);
+    clearTimeout(el["_fxT_"+cls]); el["_fxT_"+cls] = setTimeout(()=>el.classList.remove(cls), dur);
+  });
+}
+function unitSwitchFx(){
+  fxReflow(".armor", "unit-fx", 950);
+  fxReflow(".plate3d", "unit-fx", 950);
+  fxReflow("#viewTop", "unit-fx", 900);
+}
+$("#unitSwitch").querySelectorAll("button").forEach(btn=>{
+  btn.addEventListener("click", ()=>{
+    $("#unitSwitch").querySelectorAll("button").forEach(b=>b.classList.remove("on"));
+    btn.classList.add("on");
+    state.unit = btn.dataset.unit;
+    document.body.dataset.unit = state.unit;
+    const ut = $("#unitTag"); if(ut) ut.textContent = UNITS[state.unit];
+    unitSwitchFx();
+    send({cmd:"unit", value: state.unit});
+    log(`被测兵种切换 → ${UNITS[state.unit]}（轮次历史 ${curRounds().length} 条）`, "in");
+  });
+});
+
+/* ═══════════ 红蓝切换全局特效：全屏阵营闪光 + 全板扫光/冲击波/灯条呼吸 ═══════════ */
+function teamSwitchFx(){
+  document.body.classList.remove("team-fx"); void document.body.offsetWidth;
+  document.body.classList.add("team-fx");
+  setTimeout(()=>document.body.classList.remove("team-fx"), 900);
+  fxReflow(".armor", "team-fx", 950);
+  fxReflow(".plate3d", "team-fx", 950);
+  fxReflow("#viewTop", "team-fx", 900);
+  fxReflow("#viewIso", "team-fx", 900);
+}
+
+/* ═══════════ 靶车移动控制 ═══════════ */
+function setMove(dir){
+  state.move.dir = dir;
+  $("#moveBtns").querySelectorAll("button").forEach(b=>b.classList.toggle("on", b.dataset.dir===dir));
+  $("#railVis").className = "rail-vis" + (dir==="fwd"?" mv-fwd":dir==="back"?" mv-back":"");
+  const off = dir==="stop" ? 50 : (dir==="fwd" ? 50 + state.move.speed*0.4 : 50 - state.move.speed*0.4);
+  $("#railCar").style.left = `calc(${off}% - 13px)`;
+  send({cmd:"move", dir, speed: dir==="stop" ? 0 : state.move.speed});
+  log(`靶车移动 → ${dir==="fwd"?"前进":dir==="back"?"后退":"停止"} ${dir==="stop"?"":state.move.speed+"%"}`);
+}
+$("#moveBtns").querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>setMove(b.dataset.dir)));
+$("#moveSpd").addEventListener("input", e=>{
+  state.move.speed = +e.target.value;
+  e.target.style.setProperty("--p", state.move.speed + "%");
+  $("#moveSpdV").textContent = state.move.speed + "%";
+  if(state.move.dir !== "stop") setMove(state.move.dir); // 变速即时下发
+});
+
+/* ═══════════ 旋转控制 ═══════════ */
+let rotAnimId = null;
+function renderRot(){
+  const r = state.rotate;
+  $("#rotSt").textContent = r.on ? "旋转中" : "停止";
+  $("#rotDirV").textContent = r.dir === "cw" ? "顺时针" : "逆时针";
+  // 假设 100% ≈ 120 RPM
+  $("#rotRpm").textContent = r.on ? (r.speed*1.2).toFixed(0) + " RPM" : "--";
+  const disc = $("#rotDisc");
+  disc.classList.toggle("spin", r.on);
+  if(r.on){
+    const dur = Math.max(0.3, 6 - r.speed*0.055); // 速度→动画周期
+    disc.classList.toggle("rev", r.dir === "ccw");
+    disc.style.setProperty("--dur", dur + "s");
+  } else {
+    disc.classList.remove("rev");
+    disc.style.removeProperty("--dur");
+  }
+}
+$("#rotOn").addEventListener("change", e=>{
+  state.rotate.on = e.target.checked;
+  send({cmd:"rotate", on:state.rotate.on, dir:state.rotate.dir, speed:state.rotate.speed});
+  log(`旋转台 ${state.rotate.on?"启动":"停止"} · ${state.rotate.dir==="cw"?"顺时针":"逆时针"} · ${state.rotate.speed}%`);
+  renderRot();
+});
+$("#rotDirBtns").querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>{
+  $("#rotDirBtns").querySelectorAll("button").forEach(x=>x.classList.remove("on"));
+  b.classList.add("on");
+  state.rotate.dir = b.dataset.dir;
+  if(state.rotate.on){ send({cmd:"rotate", on:true, dir:state.rotate.dir, speed:state.rotate.speed}); }
+  renderRot();
+}));
+$("#rotSpd").addEventListener("input", e=>{
+  state.rotate.speed = +e.target.value;
+  e.target.style.setProperty("--p", state.rotate.speed + "%");
+  $("#rotSpdV").textContent = state.rotate.speed + "%";
+  if(state.rotate.on){ send({cmd:"rotate", on:true, dir:state.rotate.dir, speed:state.rotate.speed}); }
+  renderRot();
+});
+
+/* ═══════════ 实时俯视模型（本地仿真驱动） ═══════════ */
+// ang: 航向角(°)  rail: 轨道位置(0~100)
+// 转速换算: 100% ≈ 120RPM = 720°/s；轨道: 100% 速度约 12%/s
+const sim = {ang: 0, rail: 50, lastT: null};
+function updateModel(){
+  const cx = 42 + sim.rail*2.56;
+  $("#veh").setAttribute("transform",
+    `translate(${cx.toFixed(1)},88) rotate(${sim.ang.toFixed(1)})`);
+  // 斜视 3D：车体沿轨平移，装甲板组绕竖轴旋转
+  $("#body3d").style.transform = `translate3d(${((sim.rail-50)*2.0).toFixed(1)}px,0,0)`;
+  $("#spin3d").style.transform = `rotateZ(${sim.ang.toFixed(1)}deg)`;
+  $("#modelAng").textContent = sim.ang.toFixed(0) + "°";
+  $("#modelRail").textContent = sim.rail.toFixed(0) + "%";
+}
+function tick(t){
+  if(sim.lastT === null) sim.lastT = t;
+  const dt = Math.min(0.05, (t - sim.lastT)/1000);
+  sim.lastT = t;
+  if(state.rotate.on){
+    const sgn = state.rotate.dir === "cw" ? 1 : -1;
+    sim.ang = (sim.ang + sgn*state.rotate.speed*7.2*dt % 360 + 360) % 360;
+  }
+  if(state.move.dir !== "stop"){
+    sim.rail += (state.move.dir === "fwd" ? 1 : -1) * state.move.speed * 0.12 * dt;
+    if(sim.rail <= 0 || sim.rail >= 100){        // 到达轨道端点自动停止
+      sim.rail = Math.max(0, Math.min(100, sim.rail));
+      setMove("stop");
+      log("靶车到达轨道端点，自动停止", "er");
+    }
+  }
+  updateModel();
+  requestAnimationFrame(tick);
+}
+
+/* ═══════════ 模型视图切换（俯视/斜视） ═══════════ */
+/* iOS 分段控件滑块：thumb 跟随 .on 按钮滑动（含红蓝/兵种/方向切换） */
+const SEG_SEL = ".vtabs,.dir-btns,#teamSwitch,#unitSwitch";
+function segThumb(c){
+  const on = c.querySelector(".on"); if(!on) return;
+  let t = c.querySelector(".seg-thumb");
+  if(!t){ t = document.createElement("span"); t.className = "seg-thumb"; c.prepend(t); }
+  t.style.width = on.offsetWidth + "px";
+  t.style.transform = `translateX(${on.offsetLeft}px)`;
+}
+document.querySelectorAll(SEG_SEL).forEach(c=>{
+  segThumb(c);
+  c.querySelectorAll("button").forEach(b=>b.addEventListener("click",
+    ()=>requestAnimationFrame(()=>segThumb(c))));
+});
+// 程序化切换 .on（如到端自动停止、WS 状态同步）时同步滑块
+const segMO = new MutationObserver(muts=>muts.forEach(m=>{
+  const c = m.target.closest(SEG_SEL); if(c) segThumb(c);
+}));
+document.querySelectorAll(`${SEG_SEL} button`).forEach(b=>
+  segMO.observe(b,{attributes:true,attributeFilter:["class"]}));
+if(document.fonts && document.fonts.ready) document.fonts.ready.then(
+  ()=>document.querySelectorAll(SEG_SEL).forEach(segThumb));
+window.addEventListener("resize",
+  ()=>document.querySelectorAll(SEG_SEL).forEach(segThumb));
+
+// 切换动画：信号重捕获式闪烁 + 亮度冲击
+document.querySelectorAll(".vt").forEach(b=>b.addEventListener("click",()=>{
+  document.querySelectorAll(".vt").forEach(x=>x.classList.toggle("on", x===b));
+  const show = b.dataset.v === "top" ? $("#viewTop") : $("#viewIso");
+  $("#viewTop").style.display = b.dataset.v === "top" ? "" : "none";
+  $("#viewIso").style.display = b.dataset.v === "iso" ? "" : "none";
+  show.classList.remove("vswap"); void show.offsetWidth; show.classList.add("vswap");
+  clearTimeout(show._vsT); show._vsT = setTimeout(()=>show.classList.remove("vswap"), 620);
+}));
+
+/* ═══════════ WebSocket ═══════════ */
+function send(obj){
+  if(state.wsOk && state.ws && state.ws.readyState === 1){
+    state.ws.send(JSON.stringify(obj));
+  }
+}
+function wsConnect(){
+  const url = $("#wsUrl").value.trim();
+  if(!url) return;
+  try{ state.ws && state.ws.close(); }catch(e){}
+  log(`正在连接 ${url} ...`);
+  let ws;
+  try{ ws = new WebSocket(url); }catch(e){ log("地址无效: " + e.message, "er"); return; }
+  state.ws = ws;
+  ws.onopen = ()=>{
+    state.wsOk = true;
+    $("#wsDot").className = "dot on";
+    $("#wsBtn").textContent = "断 开";
+    log("WebSocket 已连接", "ok");
+    // 上线即同步全部当前状态
+    state.armors.forEach(a=>send({cmd:"set_id", slot:a.slot, id:a.id}));
+    send({cmd:"team", value:state.team});
+    send({cmd:"move", dir:state.move.dir, speed: state.move.dir==="stop"?0:state.move.speed});
+    send({cmd:"rotate", ...state.rotate});
+  };
+  ws.onclose = ()=>{
+    state.wsOk = false;
+    $("#wsDot").className = state.demo ? "dot" : "dot err";
+    $("#wsBtn").textContent = "连 接";
+    log("WebSocket 已断开", "er");
+  };
+  ws.onerror = ()=> log("WebSocket 错误", "er");
+  ws.onmessage = ev=>{
+    let m; try{ m = JSON.parse(ev.data); }catch(e){ return; }
+    handleData(m);
+  };
+}
+$("#wsBtn").addEventListener("click", ()=>{
+  if(state.wsOk){ state.ws.close(); } else { wsConnect(); }
+});
+$("#wsUrl").addEventListener("keydown", e=>{ if(e.key==="Enter") wsConnect(); });
+
+/* ═══════════ 数据处理（泰山派 → 前端） ═══════════ */
+function handleData(m){
+  if(m.type === "adc" && Array.isArray(m.ch) && m.ch.length === 4){
+    const a = state.armors[m.slot]; if(!a) return;
+    // 高通去趋势：减去慢速基线，剔除车体振动/静态压偏
+    const b = state.baseline[m.slot];
+    const detrended = m.ch.map((v,i)=>{
+      b[i] = b[i]*0.98 + v*0.02;         // 慢速基线跟随
+      return v - b[i];
+    });
+    a.ch = detrended;
+    const sum = detrended.reduce((s,v)=>s+Math.abs(v),0);
+    if(sum > HIT_THRESHOLD){
+      // 简单去抖：距上次命中 > HIT_DEBOUNCE 才计一次（支持快速连击）
+      if(!a.lastHitT || now() - a.lastHitT > HIT_DEBOUNCE){
+        a.lastHitT = now();
+        const pos = solveHit(detrended);
+        if(pos) onHit(a.slot, pos);
+      }
+    }
+    renderArmor(a, false);
+  }
+  else if(m.type === "hit"){
+    const a = state.armors[m.slot]; if(!a) return;
+    onHit(a.slot, {x:+m.x||0, y:+m.y||0});
+    if(typeof m.n === "number"){ a.hits = m.n; renderArmor(a,false); }
+  }
+  else if(m.type === "state"){
+    if(m.rotate){
+      state.rotate = {...state.rotate, ...m.rotate};
+      $("#rotOn").checked = state.rotate.on;
+      $("#rotDirBtns").querySelectorAll("button").forEach(b=>
+        b.classList.toggle("on", b.dataset.dir===state.rotate.dir));
+      $("#rotSpd").value = state.rotate.speed;
+      renderRot();
+    }
+  }
+}
+
+/* ═══════════ 演示模式 ═══════════ */
+function toggleDemo(){
+  state.demo = !state.demo;
+  $("#demoBtn").classList.toggle("acc", state.demo);
+  $("#demoBtn").textContent = state.demo ? "停止演示" : "演示模式";
+  if(state.demo){
+    log("演示模式启动：模拟快速连击与散布", "dm");
+    if(!$("#wsDot").classList.contains("on")) $("#wsDot").className = "dot";
+    demoAim = {slot: Math.floor(Math.random()*4), x: 50, y: 50, left: 0};
+    demoTick();
+    state.demoTimer = setInterval(demoTick, 90);
+  } else {
+    clearInterval(state.demoTimer);
+    log("演示模式停止");
+  }
+}
+// 演示瞄准点：同一块板上连续打 5~9 发（模拟快速连击散布），再换板
+let demoAim = null;
+function demoTick(){
+  if(!demoAim || demoAim.left <= 0){
+    demoAim = {slot: Math.floor(Math.random()*4),
+      x: 25 + Math.random()*50, y: 25 + Math.random()*50,
+      left: 5 + Math.floor(Math.random()*5)};
+  }
+  demoAim.left--;
+  const a = state.armors[demoAim.slot];
+  // 落点围绕瞄准点高斯抖动（弹丸散布），通道值按距离衰减
+  const jit = ()=> (Math.random()+Math.random()+Math.random()-1.5) * 14;
+  const hx = Math.max(2, Math.min(98, demoAim.x + jit()));
+  const hy = Math.max(2, Math.min(98, demoAim.y + jit()));
+  const gauss = (px,py)=> Math.exp(-(((px-hx)**2)+((py-hy)**2))/(2*30**2));
+  const raw = SENSOR_POS.map(p => Math.round(gauss(p.x,p.y) * (1500+Math.random()*1200)
+              + (Math.random()-0.5)*60));
+  handleData({type:"adc", slot:a.slot, ch:raw});
+}
+$("#demoBtn").addEventListener("click", toggleDemo);
+
+/* ═══════════ 初始化 ═══════════ */
+buildArmors();
+state.armors.forEach(a=>renderArmor(a,false));
+$("#moveSpd").dispatchEvent(new Event("input"));
+$("#rotSpd").dispatchEvent(new Event("input"));
+renderRot();
+updateModel();
+requestAnimationFrame(tick);
+log("控制台就绪 · 连接泰山派 WebSocket 或开启演示模式");
+</script>
+</body>
+</html>
