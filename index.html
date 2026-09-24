@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<title>ZJB 称重 App</title>
+<meta name="theme-color" content="#08080e">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<style>
+:root{--bg:#08080e;--pn:#12121e;--ln:#262640;--tx:#cfe3ee;--dm:#6b7a94;
+--yl:#fcee0a;--mg:#ff2a6d;--cy:#00f0ff;--gn:#00ff9d}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--tx);font:14px/1.45 system-ui,sans-serif;
+padding:10px;max-width:540px;margin:0 auto;min-height:100vh}
+body::after{content:"";position:fixed;inset:0;pointer-events:none;
+background:repeating-linear-gradient(0deg,transparent 0 3px,rgba(0,0,0,.12) 3px 4px)}
+h1{font-size:15px;letter-spacing:2px;color:var(--yl);text-transform:uppercase;
+padding:8px 2px;border-bottom:2px solid var(--yl);margin-bottom:10px;
+display:flex;justify-content:space-between;align-items:center}
+#st{font-size:10px;letter-spacing:0;color:var(--dm)}
+.card{background:var(--pn);border:1px solid var(--ln);border-radius:10px;
+padding:10px;margin-bottom:10px;transition:opacity .3s}
+.card.off{opacity:.4}
+.hd{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.hd b{color:var(--cy);letter-spacing:1px}
+.dot{width:8px;height:8px;border-radius:50%;background:#333;display:inline-block;vertical-align:middle}
+.dot.on{background:var(--gn);box-shadow:0 0 6px var(--gn)}
+.chs{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:8px}
+.ch{background:#0c0c16;border:1px solid var(--ln);border-radius:6px;padding:6px 2px;text-align:center}
+.ch i{display:block;font-style:normal;font-size:9px;color:var(--dm)}
+.ch b{font-size:12px;font-variant-numeric:tabular-nums;display:block;margin-top:2px}
+.row{display:flex;gap:6px;align-items:stretch}
+.w{flex:1;background:#0c0c16;border:1px solid var(--ln);border-radius:6px;padding:6px}
+.w i{font-style:normal;font-size:9px;color:var(--dm);display:block}
+.w b{font-size:15px;color:var(--yl);font-variant-numeric:tabular-nums}
+.tot b{color:var(--mg)}
+.btn{background:#0c0c16;color:var(--cy);border:1px solid var(--cy);border-radius:6px;
+padding:5px 12px;font-size:12px;user-select:none}
+.btn:active{background:var(--cy);color:#000}
+#tb{width:100%;background:#0c0c16;color:var(--mg);border:1px solid var(--mg);
+border-radius:10px;padding:12px;font-size:14px;letter-spacing:2px;margin-top:2px}
+#tb:active{background:var(--mg);color:#000}
+#cn{width:100%;background:#0c0c16;color:var(--gn);border:1px solid var(--gn);
+border-radius:10px;padding:12px;font-size:14px;letter-spacing:2px;margin-bottom:10px}
+#cn:active{background:var(--gn);color:#000}
+.tip{font-size:10px;color:var(--dm);text-align:center;padding:8px;line-height:1.6}
+.warn{background:#1a0a12;border:1px solid var(--mg);border-radius:10px;color:#ff8ab0;
+padding:10px;font-size:12px;margin-bottom:10px;display:none}
+</style>
+</head>
+<body>
+<h1>Armor Scale <span id=st>未连接</span></h1>
+<div class=warn id=warn>此浏览器不支持 Web Bluetooth，请用<b>安卓 Chrome</b> 打开本页面</div>
+<div id=bd></div>
+<button id=cn onclick="connect()">连接 ZJB-SCALE 蓝牙</button>
+<button id=tb onclick="tare('all')">全部去皮 TARE ALL</button>
+<div class=tip>蓝牙列表中选择 <b>ZJB-SCAL</b> · 每板去皮点卡片右上角「去皮」<br>
+断开后点顶部按钮重连 · 板卡离线请检查 I2C 接线与供电</div>
+<script>
+const NUS='6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const CH_TX='6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+const CH_RX='6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+const NAMES=['A 左上','B 右上','C 左下','D 右下'];
+let rx=null, lastDev=null;
+
+if(!navigator.bluetooth) document.getElementById('warn').style.display='block';
+
+/* ---------- 卡片 ---------- */
+const cards={},dots={},nums={},ws={},tots={};
+for(let s=0;s<4;s++){
+  const c=document.createElement('div');c.className='card off';
+  c.innerHTML=`<div class=hd><b><span class=dot id=d${s}></span> 板 ${s+1}
+    <span style="color:#6b7a94;font-size:11px">${NAMES[s]}</span></b>
+    <button class=btn onclick="tare(${s})">去皮</button></div>
+  <div class=chs>${[0,1,2,3].map(i=>`<div class=ch><i>CH${i+1}</i><b id="n${s}_${i}">--</b></div>`).join('')}</div>
+  <div class=row><div class=w><i>四角重量 W1~W4</i><b id=w${s}>--</b></div>
+  <div class="w tot"><i>总重</i><b id=t${s}>--</b></div></div>`;
+  document.getElementById('bd').appendChild(c);
+  cards[s]=c;dots[s]=document.getElementById('d'+s);
+  ws[s]=document.getElementById('w'+s);tots[s]=document.getElementById('t'+s);
+  for(let i=0;i<4;i++)nums[s*4+i]=document.getElementById('n'+s+'_'+i);
+}
+const st=t=>document.getElementById('st').textContent=t;
+const fmt=v=>v==null?'--':(Math.abs(v)>=1000?(v/1000).toFixed(2)+'k':Math.round(v));
+
+/* ---------- 数据更新 ---------- */
+function upd(j){
+  if(j.s<0){ st('蓝牙已连接 · 等待板卡上线'); return; }   // 空总线心跳
+  const s=j.s; if(s>3) return;
+  if(j.net===undefined){          // 未去皮或离线
+    cards[s].classList.add('off');dots[s].className='dot';
+    st('板 '+s+' 等待去皮/离线 (S:'+j.st+')');
+    return;
+  }
+  cards[s].classList.remove('off');dots[s].className='dot on';
+  for(let i=0;i<4;i++)nums[s*4+i].textContent=fmt(j.net[i]);
+  ws[s].textContent=j.w.map(v=>v.toFixed(2)).join(' / ');
+  tots[s].textContent=j.t.toFixed(2);
+  st('实时 · 板 '+s+' S:'+j.st);
+}
+function onData(buf){
+  let s=new TextDecoder().decode(buf), j;
+  try{j=JSON.parse(s)}catch(e){return}
+  upd(j);
+}
+
+/* ---------- 蓝牙 ---------- */
+async function bind(server){
+  const svc=await server.getPrimaryService(NUS);
+  const tx=await svc.getCharacteristic(CH_TX);
+  await tx.startNotifications();
+  tx.addEventListener('characteristicvaluechanged',
+    e=>onData(e.target.value));
+  rx=await svc.getCharacteristic(CH_RX);
+}
+async function connect(reuse){
+  if(!navigator.bluetooth) return;
+  try{
+    st(reuse?'重连中...':'选择设备...');
+    const dev = reuse&&lastDev ? lastDev :
+      await navigator.bluetooth.requestDevice({filters:[{services:[NUS]}]});
+    lastDev=dev;
+    st('连接中...');
+    const server=await dev.gatt.connect();
+    await bind(server);
+    st('已连接 '+ (dev.name||''));
+    document.getElementById('cn').textContent='重新连接（断线后点击）';
+    dev.addEventListener('gattserverdisconnected',()=>{
+      st('蓝牙已断开，点顶部按钮重连');rx=null;
+      for(let s=0;s<4;s++){cards[s].classList.add('off');dots[s].className='dot'}
+    });
+  }catch(err){
+    st('连接失败: '+err.message);
+  }
+}
+/* 断线后顶部按钮智能重连：已有设备直接连，否则重新选择 */
+document.getElementById('cn').addEventListener('click',e=>{
+  if(lastDev&&lastDev.gatt&&!lastDev.gatt.connected) connect(true);
+});
+function tare(s){
+  if(!rx){st('未连接，先点顶部连接');return}
+  const cmd=s==='all'?'T':String(s);
+  rx.writeValue(new TextEncoder().encode(cmd)).catch(()=>st('发送失败，蓝牙可能已断开'));
+}
+</script>
+<script>
+if ('serviceWorker' in navigator) {
+  addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(()=>{}));
+}
+</script>
+</body>
+</html>
